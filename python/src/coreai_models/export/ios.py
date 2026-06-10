@@ -86,10 +86,17 @@ def _build_ios_reference_inputs(
     else:
         head_dim = config.hidden_size // config.num_attention_heads
 
+    # Merged dual cache for models with global_head_dim (e.g. Gemma4)
+    global_head_dim = getattr(config, "global_head_dim", None)
+    if global_head_dim is not None:
+        kv_channels = config.num_key_value_heads * (head_dim + global_head_dim)
+    else:
+        kv_channels = config.num_key_value_heads * head_dim
+
     key_cache = torch.zeros(
         config.num_hidden_layers,
         1,
-        config.num_key_value_heads * head_dim,
+        kv_channels,
         1,
         max_context_length,
         dtype=torch.float16,
@@ -110,6 +117,15 @@ def _build_ios_reference_inputs(
         EMBEDDING_TABLE_INPUT_NAME: embedding_table,
     }
 
+    # PLE input for models with externalized per-layer embeddings (e.g. Gemma4)
+    ple_dim_per_layer = getattr(config, "hidden_size_per_layer_input", 0)
+    if ple_dim_per_layer and hasattr(model, "_ple_weight"):
+        ple_total_dim = config.num_hidden_layers * ple_dim_per_layer
+        ple_embeddings = torch.randint(
+            -128, 127, (batch_size, query_len, 1, ple_total_dim), dtype=torch.int8
+        )
+        forward_inputs["ple_embeddings"] = ple_embeddings
+
     embed_tokens_inputs = (input_ids, embedding_table)
 
     seq_len_dim = torch.export.Dim("seq_len", max=max_context_length)
@@ -124,6 +140,9 @@ def _build_ios_reference_inputs(
         VALUE_CACHE_INPUT_NAME: {4: cache_len_dim},
         EMBEDDING_TABLE_INPUT_NAME: None,
     }
+
+    if ple_dim_per_layer and hasattr(model, "_ple_weight"):
+        forward_dynamic_shapes["ple_embeddings"] = {1: seq_len_dim}
 
     embed_tokens_dynamic_shapes = {
         "input_ids": {1: seq_len_dim},
@@ -204,6 +223,8 @@ async def _convert_to_coreai(
     kv_cached_embed_size: int,
     hidden_size: int,
     num_layers: int,
+    has_ple: bool = False,
+    ple_total_dim: int = 0,
 ) -> AIProgram:
     """Convert exported programs to a single AIProgram with iOS constraints.
 
@@ -237,6 +258,8 @@ async def _convert_to_coreai(
         CAUSAL_MASK_INPUT_NAME,
         EMBEDDING_TABLE_INPUT_NAME,
     ]
+    if has_ple:
+        input_names.append("ple_embeddings")
     state_names = [
         KEY_CACHE_INPUT_NAME,
         VALUE_CACHE_INPUT_NAME,
@@ -270,23 +293,31 @@ async def _convert_to_coreai(
         gather_static_cfg[f'"{q_len}"'] = {TOKEN_IDS_INPUT_NAME: (1, q_len)}
 
     forward_static_cfg: dict[str, dict[str, tuple[int, ...]]] = {}
+    # Context-length ladder (256, 512, ... up to max_context_length). The runner
+    # picks the smallest cache window covering the current position, so decode
+    # doesn't always pay for the full max_context_length.
     cache_len = 256
     while cache_len <= max_context_length:
         for q_len in query_lengths:
-            forward_static_cfg[f'"{cache_len}_{q_len}"'] = {
+            cfg = {
                 TRANSFORMER_INPUT_NAME: (1, q_len, 1, hidden_size),
                 POSITION_IDS_INPUT_NAME: (1, q_len),
                 CAUSAL_MASK_INPUT_NAME: (1, cache_len, 1, q_len),
                 KEY_CACHE_INPUT_NAME: (num_layers, 1, kv_cached_embed_size, 1, cache_len),
                 VALUE_CACHE_INPUT_NAME: (num_layers, 1, kv_cached_embed_size, 1, cache_len),
             }
+            if has_ple:
+                # PLE seq dim must be specialized alongside transformer_input, else it
+                # stays dynamic in the otherwise-static specialized function.
+                cfg["ple_embeddings"] = (1, q_len, 1, ple_total_dim)
+            forward_static_cfg[f'"{cache_len}_{q_len}"'] = cfg
         cache_len *= 2
 
     coreai_program.set_static_shape_config(GATHER_EMBEDDINGS_FUNCTION_NAME, gather_static_cfg)
     coreai_program.set_static_shape_config(EXTEND_FUNCTION_NAME, forward_static_cfg)
     coreai_program.set_static_shape_config(PROMPT_OPT_FUNCTION_NAME, forward_static_cfg)
 
-    # ----- Hardware constraints -----
+    # ----- Hardware constraints + optimization -----
     emb_table_constraints = HardwareConstraints(
         AllocationType.IOSurface, interleave=[8, 1, 1], alignments=[1, 1, 1, 1]
     )
@@ -306,12 +337,11 @@ async def _convert_to_coreai(
     }
     load_constraints = {EMBEDDING_TABLE_INPUT_NAME: emb_table_constraints}
 
+    logger.info("Applying optimization passes...")
     coreai_program.set_hardware_constraints(LOAD_EMBEDDINGS_FUNCTION_NAME, load_constraints)
     coreai_program.set_hardware_constraints(GATHER_EMBEDDINGS_FUNCTION_NAME, gather_constraints)
     coreai_program.set_hardware_constraints(EXTEND_FUNCTION_NAME, forward_constraints)
     coreai_program.set_hardware_constraints(PROMPT_OPT_FUNCTION_NAME, forward_constraints)
-
-    logger.info("Applying optimization passes...")
     coreai_program.optimize()
 
     return coreai_program
@@ -366,15 +396,28 @@ async def export_ios_model(
         head_dim = config.head_dim
     else:
         head_dim = config.hidden_size // config.num_attention_heads
+
+    global_head_dim = getattr(config, "global_head_dim", None)
+    if global_head_dim is not None:
+        kv_cached_embed_size = config.num_key_value_heads * (head_dim + global_head_dim)
+    else:
+        kv_cached_embed_size = config.num_key_value_heads * head_dim
+
+    has_ple = hasattr(model, "_ple_weight")
+    ple_dim_per_layer = getattr(config, "hidden_size_per_layer_input", 0)
+    ple_total_dim = config.num_hidden_layers * ple_dim_per_layer if has_ple else 0
+
     coreai_program = await _convert_to_coreai(
         extend_program=extend_program,
         prompt_program=prompt_program,
         gather_embeddings_program=gather_program,
         load_embeddings_program=load_program,
         max_context_length=max_context_length,
-        kv_cached_embed_size=config.num_key_value_heads * head_dim,
+        kv_cached_embed_size=kv_cached_embed_size,
         hidden_size=config.hidden_size,
         num_layers=config.num_hidden_layers,
+        has_ple=has_ple,
+        ple_total_dim=ple_total_dim,
     )
 
     return coreai_program

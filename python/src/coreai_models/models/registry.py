@@ -30,6 +30,7 @@ class ModelEntry:
 @lru_cache(maxsize=1)
 def _get_registry() -> dict[str, ModelEntry]:
     """Build the model registry (cached singleton). Lazy imports to avoid circular deps."""
+    from coreai_models.models.ios.gemma4_text import Gemma4ForCausalLMForiOS
     from coreai_models.models.ios.mistral import MistralForCausalLMForiOS
     from coreai_models.models.ios.qwen2 import Qwen2ForCausalLMForiOS
     from coreai_models.models.ios.qwen3 import Qwen3ForCausalLMForiOS
@@ -44,6 +45,11 @@ def _get_registry() -> dict[str, ModelEntry]:
     return {
         "gemma3_text": ModelEntry(
             macos_class=Gemma3ForCausalLM,
+            hf_config_attr="text_config",
+            hf_state_dict_prefix="language_model.",
+        ),
+        "gemma4_text": ModelEntry(
+            ios_class=Gemma4ForCausalLMForiOS,
             hf_config_attr="text_config",
             hf_state_dict_prefix="language_model.",
         ),
@@ -74,6 +80,7 @@ def _get_registry() -> dict[str, ModelEntry]:
 # Type alias for the remapping dict
 MODEL_TYPE_REMAPPING: dict[str, str] = {
     "gemma3": "gemma3_text",
+    "gemma4": "gemma4_text",
     "qwen2_5": "qwen2",
 }
 

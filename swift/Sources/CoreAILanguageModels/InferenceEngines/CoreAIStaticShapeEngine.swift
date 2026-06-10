@@ -37,6 +37,11 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     // Embedding table loaded once at init.
     private let embeddingTable: NDArray
 
+    // Externalized Per-Layer Embeddings (Gemma4), loaded once at init when the
+    // model graph declares a `ple_embeddings` input. nil for models without PLE.
+    private let perLayerEmbeddings: PerLayerEmbeddings?
+    private static let pleInputName = "ple_embeddings"
+
     // Largest query length across all extend functions — used as prefill threshold.
     private let maxQueryLength: Int
 
@@ -49,7 +54,11 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
 
     // MARK: - Initialization
 
-    public init(configuration: ModelConfig, preparedModel: PreparedModel) async throws {
+    public init(
+        configuration: ModelConfig,
+        preparedModel: PreparedModel,
+        perLayerEmbeddingsURL: URL? = nil
+    ) async throws {
         self.config = configuration
         self.model = preparedModel.model
         self.functions = [:]
@@ -95,6 +104,21 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         // Load embeddings
         self.embeddingTable = try await Self.loadEmbeddingTable(from: model)
 
+        // Load externalized Per-Layer Embeddings (Gemma4) if the graph wants them.
+        let wantsPLE = largestExtendDescriptor.inputNames.contains(Self.pleInputName)
+        if wantsPLE {
+            guard let pleURL = perLayerEmbeddingsURL else {
+                throw InferenceRuntimeError.invalidState(
+                    "Model declares '\(Self.pleInputName)' input but no PLE artifact was provided")
+            }
+            let ple = try PerLayerEmbeddings(contentsOf: pleURL)
+            CLILogger.log(
+                "Loaded PLE table: vocab=\(ple.vocabSize), rowWidth=\(ple.rowWidth) from \(pleURL.lastPathComponent)")
+            self.perLayerEmbeddings = ple
+        } else {
+            self.perLayerEmbeddings = nil
+        }
+
         // Allocate KV cache IOSurfaces sized to the max-context descriptor
         if case .ndArray(let keyCacheDescriptor) = largestExtendDescriptor.stateDescriptor(of: Self.keyCacheName),
             case .ndArray(let valueCacheDescriptor) = largestExtendDescriptor.stateDescriptor(of: Self.valueCacheName)
@@ -114,7 +138,23 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
 
     public convenience init(configuration: ModelConfig, modelURL: URL) async throws {
         let preparedModel = try await PreparedModel.prepare(at: modelURL)
-        try await self.init(configuration: configuration, preparedModel: preparedModel)
+        let pleURL = Self.resolvePerLayerEmbeddingsURL(near: modelURL)
+        try await self.init(
+            configuration: configuration,
+            preparedModel: preparedModel,
+            perLayerEmbeddingsURL: pleURL
+        )
+    }
+
+    /// Looks for a sibling `*_ple.safetensors` artifact in the bundle directory
+    /// (the parent of the `.aimodel`). Returns nil when none is present.
+    static func resolvePerLayerEmbeddingsURL(near modelURL: URL) -> URL? {
+        let bundleDir = modelURL.deletingLastPathComponent()
+        guard
+            let entries = try? FileManager.default.contentsOfDirectory(
+                at: bundleDir, includingPropertiesForKeys: nil)
+        else { return nil }
+        return entries.first { $0.lastPathComponent.hasSuffix("_ple.safetensors") }
     }
 
     // MARK: - Initialization Helpers
@@ -240,10 +280,15 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         descriptor: InferenceFunctionDescriptor, config: ModelConfig
     ) -> Int {
         if case .ndArray(let keyDesc) = descriptor.stateDescriptor(of: keyCacheName) {
+            // A dynamic (-1) last dim can't be a concrete context length; fall
+            // back to the configured max so function selection still matches.
             if keyDesc.shape.contains(-1) {
                 return config.maxContextLength
             }
-            return keyDesc.shape.max() ?? config.maxContextLength
+            // KV cache shape is [n_layers, batch, channels, 1, seq_len]; the
+            // context length is the last dimension. (Not max(): models with a
+            // merged dual-head-dim cache have more channels than context.)
+            return keyDesc.shape.last ?? config.maxContextLength
         }
         return config.maxContextLength
     }
@@ -518,6 +563,37 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             }
             stepSpan[0] = Int32(alignedStep)
             inputs[stepName] = step
+        }
+
+        // Per-Layer Embeddings (Gemma4): gather INT8 rows for this batch's tokens.
+        if desc.inputNames.contains(Self.pleInputName),
+            case .ndArray(let nd) = desc.inputDescriptor(of: Self.pleInputName)
+        {
+            guard let ple = perLayerEmbeddings else {
+                throw InferenceRuntimeError.invalidState(
+                    "Graph '\(graphName)' wants '\(Self.pleInputName)' but no PLE table is loaded")
+            }
+            let elementCount = nd.shape.reduce(1, *)
+            let rowWidth = nd.shape.last ?? ple.rowWidth
+            guard rowWidth == ple.rowWidth else {
+                throw InferenceRuntimeError.invalidState(
+                    "PLE row width mismatch: graph expects \(rowWidth), table has \(ple.rowWidth)")
+            }
+            var pleArray = NDArray(descriptor: nd)
+            var pleView = pleArray.mutableView(as: Int8.self)
+            // The flat row-major gather below assumes a contiguous buffer; the
+            // ple_embeddings input is exported without interleave so it is, but
+            // verify rather than silently write to wrong offsets.
+            guard pleView.contiguousElements != nil else {
+                throw InferenceRuntimeError.invalidState(
+                    "ple_embeddings array has non-contiguous layout")
+            }
+            pleView.withUnsafeMutablePointer { ptr, _, _ in
+                ptr.update(repeating: 0, count: elementCount)
+                let buf = UnsafeMutableBufferPointer(start: ptr, count: elementCount)
+                ple.gather(tokenIDs: Array(batchTokens), batchSize: batchSize, into: buf)
+            }
+            inputs[Self.pleInputName] = pleArray
         }
 
         return inputs

@@ -52,28 +52,25 @@ class SDPA(nn.Module):
             torch.Tensor: Attention output with shape (batch_size, n_heads*head_dim, 1, seq_len)
         """
 
-        # Apply the scale factor before QK^T for numerical stability
-        key = key.transpose(-3, -1) * self._scale_factor
-        queries = query.split(self.head_dim, dim=1)
-        keys = list(key.split(self.head_dim, dim=-1))
+        # Apply the scale factor before QK^T for numerical stability. Keep
+        # everything in BC1S split-by-head form so the matmuls are expressed as
+        # direct einsum contractions — no per-head permute/reshape into and out
+        # of (B, 1, S, head_dim) layout, which would otherwise force memory
+        # copies in the compiled graph (one per head, per matmul).
+        key = key * self._scale_factor
+        queries = query.split(self.head_dim, dim=1)  # each (B, head_dim, 1, S_q)
+        keys = key.split(self.head_dim, dim=1)  # each (B, head_dim, 1, S_k)
+        values = value.split(self.head_dim, dim=1)  # each (B, head_dim, 1, S_k)
 
         n_heads = len(queries)
+        kv_group_size = n_heads // len(keys)
 
-        # permute key heads in advance
-        for kv_idx in range(len(keys)):
-            keys[kv_idx] = keys[kv_idx].permute(0, 2, 3, 1)
-
-        kv_group_size = len(queries) // len(keys)
-
+        # Q @ K^T per head, contracting head_dim (d) while preserving the
+        # singleton (o): (B, head_dim, 1, S_q) x (B, head_dim, 1, S_k) -> (B, S_k, 1, S_q)
         scores = []
-
         for head_idx in range(n_heads):
             kv_idx = head_idx // kv_group_size
-            q = queries[head_idx].permute(0, 2, 3, 1)
-            k = keys[kv_idx]
-            attn_score = q @ k
-            attn_score = attn_score.permute(0, 3, 1, 2)
-            scores.append(attn_score)
+            scores.append(torch.einsum("bdoq,bdok->bkoq", queries[head_idx], keys[kv_idx]))
 
         full_scores = torch.cat(scores, dim=2)
         masked_scores = full_scores + torch.cat([causal_mask] * n_heads, dim=2)
@@ -81,20 +78,12 @@ class SDPA(nn.Module):
 
         scores = full_scores.split(1, dim=2)
 
-        values = list(value.split(self.head_dim, dim=1))
-
-        # transpose values in advance
-        for kv_idx in range(len(values)):
-            values[kv_idx] = values[kv_idx].permute(0, 2, 3, 1).squeeze(1)
-
+        # scores @ V per head, contracting the key axis (k):
+        # (B, S_k, 1, S_q) x (B, head_dim, 1, S_k) -> (B, head_dim, 1, S_q)
         weights = []
         for head_idx in range(n_heads):
             kv_idx = head_idx // kv_group_size
-            s = scores[head_idx].permute(0, 2, 3, 1).squeeze(1)
-            v = values[kv_idx]
-            weight = (s @ v).unsqueeze(1)
-            weight = weight.permute(0, 3, 1, 2)
-            weights.append(weight)
+            weights.append(torch.einsum("bkoq,bdok->bdoq", scores[head_idx], values[kv_idx]))
 
         final_score = torch.cat(weights, dim=1)
         return final_score

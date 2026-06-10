@@ -162,6 +162,26 @@ LLM_PRESETS: list[ModelPreset] = [
         4096,
         compression_config="models/qwen3/qwen3_4b_mixed_4bit_8bit.yaml",
     ),
+    ModelPreset(
+        "gemma-4-e2b-it",
+        "google/gemma-4-E2B-it",
+        "gemma4",
+        "llm",
+        "iOS",
+        "4bit_weight_palettized_group32",
+        "float16",
+        4096,
+    ),
+    ModelPreset(
+        "gemma-4-e4b-it",
+        "google/gemma-4-E4B-it",
+        "gemma4",
+        "llm",
+        "iOS",
+        "4bit_weight_palettized_group32",
+        "float16",
+        4096,
+    ),
 ]
 
 # ---------------------------------------------------------------------------

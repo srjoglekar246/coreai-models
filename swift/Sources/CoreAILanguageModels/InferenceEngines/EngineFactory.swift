@@ -195,9 +195,14 @@ public struct EngineFactory: Sendable {
         switch variant {
         case .staticShape:
             CLILogger.log("Creating static-shape engine")
+            let pleURL = StaticShapeEngine.resolvePerLayerEmbeddingsURL(near: modelURL)
+            if let pleURL = pleURL {
+                CLILogger.log("  - PLE artifact: \(pleURL.lastPathComponent)")
+            }
             return try await StaticShapeEngine(
                 configuration: modelConfig,
-                preparedModel: preparedModel
+                preparedModel: preparedModel,
+                perLayerEmbeddingsURL: pleURL
             )
 
         case .sequential:

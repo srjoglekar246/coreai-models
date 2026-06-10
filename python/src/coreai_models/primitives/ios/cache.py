@@ -165,6 +165,65 @@ class KVCacheHandler:
 
         return self._k_cache[layer_idx], self._v_cache[layer_idx]
 
+    def update_and_fetch_channels(
+        self: Self,
+        layer_idx: int,
+        offset: torch.IntTensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        num_token_updates: int,
+        channel_begin: int,
+        channel_end: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Update a channel sub-range of the KV cache for a specific layer.
+
+        Used when sliding and global KV caches are merged along the channel
+        dimension into a single buffer. Each attention layer writes to its
+        own channel slice.
+
+        Args:
+            layer_idx: Index of the transformer layer.
+            offset: Starting position in the sequence dimension for the update.
+            k: New key tensor to insert, shape (batch, channels, 1, seq).
+            v: New value tensor to insert, shape (batch, channels, 1, seq).
+            num_token_updates: Number of tokens being updated.
+            channel_begin: Start index of the channel sub-range (inclusive).
+            channel_end: End index of the channel sub-range (exclusive).
+
+        Returns:
+            Tuple of (key_cache_slice, value_cache_slice) for the specified
+            layer and channel range.
+        """
+        assert self._k_cache is not None and self._v_cache is not None, (
+            "Cannot call update_and_fetch_channels before registering key/value cache!"
+        )
+
+        torch._check_is_size(layer_idx, message="int layer index >= 0")
+        torch._check(
+            layer_idx < self._k_cache.size(0),
+            message="layer index < number of transformer layers",
+        )
+        torch._check(
+            layer_idx < self._v_cache.size(0),
+            message="layer index < number of transformer layers",
+        )
+
+        layer_index = self._layer_indices[layer_idx]
+        layer_index_end = self._layer_indices_end[layer_idx]
+        ch_begin = torch.tensor((channel_begin,), dtype=torch.int32)
+        ch_end = torch.tensor((channel_end,), dtype=torch.int32)
+
+        begin = torch.cat([layer_index, self._zero, ch_begin, self._zero, offset])
+        end = torch.cat([layer_index_end, self._one, ch_end, self._one, offset + num_token_updates])
+
+        mutable_slice_update(x=self._k_cache, update=k.unsqueeze(0), begin=begin, end=end)
+        mutable_slice_update(x=self._v_cache, update=v.unsqueeze(0), begin=begin, end=end)
+
+        return (
+            self._k_cache[layer_idx, :, channel_begin:channel_end, :, :],
+            self._v_cache[layer_idx, :, channel_begin:channel_end, :, :],
+        )
+
     @property
     def k_cache(self) -> torch.Tensor:
         return self._k_cache

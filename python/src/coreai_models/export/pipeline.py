@@ -283,10 +283,16 @@ async def _async_export_model(config: ExportConfig) -> str:
                 head_dim = hf_config.head_dim
             else:
                 head_dim = hf_config.hidden_size // hf_config.num_attention_heads
+            # Merged dual cache for models with global_head_dim (e.g. Gemma4)
+            global_head_dim = getattr(hf_config, "global_head_dim", None)
+            if global_head_dim is not None:
+                kv_channels = hf_config.num_key_value_heads * (head_dim + global_head_dim)
+            else:
+                kv_channels = hf_config.num_key_value_heads * head_dim
             key_cache = torch.zeros(
                 hf_config.num_hidden_layers,
                 1,  # batch_size
-                hf_config.num_key_value_heads * head_dim,
+                kv_channels,
                 1,
                 effective_max_ctx,
                 dtype=torch.float16,
@@ -300,6 +306,16 @@ async def _async_export_model(config: ExportConfig) -> str:
                 key_cache,
                 value_cache,
             )
+            # Models with externalized Per-Layer Embeddings (Gemma4) take an
+            # extra INT8 ple_embeddings arg; include it so the calibration trace
+            # exercises the per-layer projection weights.
+            ple_dim_per_layer = getattr(hf_config, "hidden_size_per_layer_input", 0)
+            if ple_dim_per_layer and hasattr(model, "_ple_weight"):
+                ple_total_dim = hf_config.num_hidden_layers * ple_dim_per_layer
+                ple_embeddings = torch.randint(
+                    -128, 127, (batch_size, query_len, 1, ple_total_dim), dtype=torch.int8
+                )
+                palettization_inputs = (*palettization_inputs, ple_embeddings)
             model = palettize_pytorch_model(model, palettization_inputs, torch_palettization_config)
 
         # ---- 4. Variant-specific export ----
@@ -308,9 +324,7 @@ async def _async_export_model(config: ExportConfig) -> str:
         else:
             coreai_program = await export_ios_model(model, hf_config, config)
 
-        del model
-
-        # ---- 5. Save inside bundle directory ----
+        # ---- 5. Resolve bundle paths (needed before freeing the model) ----
         output_dir = Path(config.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -319,6 +333,19 @@ async def _async_export_model(config: ExportConfig) -> str:
         bundle_path.mkdir(parents=True, exist_ok=True)
         aimodel_path = bundle_path / f"{output_name}.aimodel"
 
+        # Dump externalized Per-Layer Embeddings (PLE) as a separate INT8
+        # artifact while the model is still in memory. The runner mmaps this
+        # file and gathers per-token rows to feed the ``ple_embeddings`` input.
+        ple_filename = None
+        if hasattr(model, "dump_ple_embedding") and hasattr(model, "_ple_weight"):
+            logger.info("Dumping Per-Layer Embeddings (PLE) artifact...")
+            ple_path = model.dump_ple_embedding(str(bundle_path), output_name)
+            ple_filename = Path(ple_path).name
+            logger.info(f"Wrote PLE artifact to {ple_path}")
+
+        del model
+
+        # ---- 6. Save inside bundle directory ----
         if aimodel_path.exists():
             if config.overwrite:
                 import shutil
@@ -341,6 +368,7 @@ async def _async_export_model(config: ExportConfig) -> str:
             hf_config=hf_config,
             compression=config.compression,
             name=output_name,
+            per_layer_embeddings=ple_filename,
         )
 
     logger.info(f"Export complete: {bundle_path}")

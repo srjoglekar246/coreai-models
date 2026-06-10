@@ -494,7 +494,8 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
                 samplingConfiguration: samplingConfiguration,
                 maxTokens: maxTokens,
                 actualInputTokens: actualInputTokens,
-                modelVocabSize: modelVocabSize
+                modelVocabSize: modelVocabSize,
+                extraEOSTokenIds: bundle.language.eosTokenIds ?? []
             )
         } else {
             // Generate text (timing handled by decoding strategies)
@@ -505,7 +506,8 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             // Encode stop tokens to sequences
             let stopSequences = try validateAndEncodeStopTokens(
                 stopTokens: stopTokens,
-                tokenizer: tokenizer
+                tokenizer: tokenizer,
+                extraEOSTokenIds: bundle.language.eosTokenIds ?? []
             )
 
             // Check if logits are requested
@@ -590,7 +592,8 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         samplingConfiguration: SamplingConfiguration,
         maxTokens: Int,
         actualInputTokens: Int,
-        modelVocabSize: Int?
+        modelVocabSize: Int?,
+        extraEOSTokenIds: [Int] = []
     ) async throws {
         let schema: String
         if FileManager.default.fileExists(atPath: schemaInput) {
@@ -603,7 +606,8 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
 
         let stopSequences = try validateAndEncodeStopTokens(
             stopTokens: stopTokens,
-            tokenizer: tokenizer
+            tokenizer: tokenizer,
+            extraEOSTokenIds: extraEOSTokenIds
         )
 
         guard let vocabSize = modelVocabSize else {
@@ -678,9 +682,17 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     /// - Returns: StopSequences containing all valid sequences plus tokenizer EOS tokens
     func validateAndEncodeStopTokens(
         stopTokens: [String],
-        tokenizer: any Tokenizer
+        tokenizer: any Tokenizer,
+        extraEOSTokenIds: [Int] = []
     ) throws -> StopSequences {
         var sequences: [[Int32]] = []
+
+        // Bundle-declared end-of-generation token ids (e.g. Gemma's
+        // <end_of_turn>) that the tokenizer's single eos_token doesn't cover.
+        for id in extraEOSTokenIds {
+            sequences.append([Int32(id)])
+            CLILogger.log("Added EOS stop token id \(id) from bundle metadata", component: "Main")
+        }
 
         for stopString in stopTokens {
             let tokens = tokenizer.encode(text: stopString).map { Int32($0) }

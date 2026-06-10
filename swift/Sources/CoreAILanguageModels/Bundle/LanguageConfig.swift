@@ -20,18 +20,25 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
     /// known role conventions (`main`, `extend_<N>`, `load_embeddings`, ...).
     public let functionMap: FunctionMap?
 
+    /// End-of-generation token ids beyond the tokenizer's single `eos_token`.
+    /// Chat models (e.g. Gemma's `<end_of_turn>`) stop on additional ids that
+    /// the tokenizer config alone doesn't expose. Empty/nil when unspecified.
+    public let eosTokenIds: [Int]?
+
     public init(
         tokenizer: String,
         vocabSize: Int,
         maxContextLength: Int,
         embeddedTokenizer: Bool = true,
-        functionMap: FunctionMap? = nil
+        functionMap: FunctionMap? = nil,
+        eosTokenIds: [Int]? = nil
     ) {
         self.tokenizer = tokenizer
         self.vocabSize = vocabSize
         self.maxContextLength = maxContextLength
         self.embeddedTokenizer = embeddedTokenizer
         self.functionMap = functionMap
+        self.eosTokenIds = eosTokenIds
     }
 
     enum CodingKeys: String, CodingKey {
@@ -40,6 +47,7 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         case maxContextLength = "max_context_length"
         case embeddedTokenizer = "embedded_tokenizer"
         case functionMap = "function_map"
+        case eosTokenIds = "eos_token_ids"
     }
 
     public init(from decoder: Decoder) throws {
@@ -49,5 +57,6 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         self.maxContextLength = try c.decode(Int.self, forKey: .maxContextLength)
         self.embeddedTokenizer = try c.decodeIfPresent(Bool.self, forKey: .embeddedTokenizer) ?? true
         self.functionMap = try c.decodeIfPresent(FunctionMap.self, forKey: .functionMap)
+        self.eosTokenIds = try c.decodeIfPresent([Int].self, forKey: .eosTokenIds)
     }
 }
