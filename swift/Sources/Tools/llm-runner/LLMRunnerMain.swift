@@ -339,7 +339,8 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             vocabSize: bundle.vocabSize,
             maxContextLength: bundle.maxContextLength,
             serializedModel: [bundle.modelAssetPath],
-            function: bundle.language.functionMap?.name(for: "main") ?? "main"
+            function: bundle.language.functionMap?.name(for: "main") ?? "main",
+            slidingWindow: bundle.slidingWindow
         )
         let configData = try JSONEncoder().encode(engineConfig)
 

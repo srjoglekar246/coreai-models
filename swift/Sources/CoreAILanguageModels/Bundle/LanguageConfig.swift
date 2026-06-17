@@ -25,13 +25,19 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
     /// the tokenizer config alone doesn't expose. Empty/nil when unspecified.
     public let eosTokenIds: [Int]?
 
+    /// Sliding-window size for models with a sliding KV cache (Gemma4). The
+    /// runner uses it to build the windowed `sliding_causal_mask`. nil when the
+    /// model has no sliding-window attention.
+    public let slidingWindow: Int?
+
     public init(
         tokenizer: String,
         vocabSize: Int,
         maxContextLength: Int,
         embeddedTokenizer: Bool = true,
         functionMap: FunctionMap? = nil,
-        eosTokenIds: [Int]? = nil
+        eosTokenIds: [Int]? = nil,
+        slidingWindow: Int? = nil
     ) {
         self.tokenizer = tokenizer
         self.vocabSize = vocabSize
@@ -39,6 +45,7 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         self.embeddedTokenizer = embeddedTokenizer
         self.functionMap = functionMap
         self.eosTokenIds = eosTokenIds
+        self.slidingWindow = slidingWindow
     }
 
     enum CodingKeys: String, CodingKey {
@@ -48,6 +55,7 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         case embeddedTokenizer = "embedded_tokenizer"
         case functionMap = "function_map"
         case eosTokenIds = "eos_token_ids"
+        case slidingWindow = "sliding_window"
     }
 
     public init(from decoder: Decoder) throws {
@@ -58,5 +66,6 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         self.embeddedTokenizer = try c.decodeIfPresent(Bool.self, forKey: .embeddedTokenizer) ?? true
         self.functionMap = try c.decodeIfPresent(FunctionMap.self, forKey: .functionMap)
         self.eosTokenIds = try c.decodeIfPresent([Int].self, forKey: .eosTokenIds)
+        self.slidingWindow = try c.decodeIfPresent(Int.self, forKey: .slidingWindow)
     }
 }

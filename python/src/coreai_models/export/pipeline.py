@@ -35,7 +35,12 @@ from coreai_models.export.compression import (
     palettize_pytorch_model,
     quantize_pytorch_model,
 )
-from coreai_models.export.ios import export_ios_model
+from coreai_models.export.ios import (
+    DEFAULT_KV_BLOCK_SIZE,
+    QUERY_LENGTHS,
+    export_ios_model,
+    sliding_ring_size,
+)
 from coreai_models.export.macos import export_macos_model
 from coreai_models.export.metadata import build_aimodel_metadata
 from coreai_models.export.presets import (
@@ -285,27 +290,67 @@ async def _async_export_model(config: ExportConfig) -> str:
                 head_dim = hf_config.hidden_size // hf_config.num_attention_heads
             # Merged dual cache for models with global_head_dim (e.g. Gemma4)
             global_head_dim = getattr(hf_config, "global_head_dim", None)
-            if global_head_dim is not None:
-                kv_channels = hf_config.num_key_value_heads * (head_dim + global_head_dim)
+            has_sliding = hasattr(model, "extend") and hasattr(model.extend, "sliding_cache")
+            if has_sliding:
+                # Two compacted caches + the runner-built sliding mask (Gemma4). The
+                # global cache is blocked (5D, block-outermost) so it stays resident
+                # on the Neural Engine at large context; the global mask is blocked
+                # too and the runner supplies the destination block index.
+                n_kv = hf_config.num_key_value_heads
+                n_global_storing = model.extend.model.n_global_storing
+                n_sliding_storing = model.extend.model.n_sliding_storing
+                sliding_ring = sliding_ring_size(hf_config.sliding_window, max(QUERY_LENGTHS))
+                block_size = getattr(model.extend.model, "kv_block_size", DEFAULT_KV_BLOCK_SIZE)
+                n_blocks = (effective_max_ctx + block_size - 1) // block_size
+                key_cache = torch.zeros(
+                    n_blocks, n_global_storing, n_kv * global_head_dim, 1, block_size,
+                    dtype=torch.float16,
+                )
+                value_cache = key_cache.clone()
+                sliding_key_cache = torch.zeros(
+                    n_sliding_storing, 1, n_kv * head_dim, 1, sliding_ring, dtype=torch.float16
+                )
+                sliding_value_cache = sliding_key_cache.clone()
+                sliding_causal_mask = torch.zeros(1, sliding_ring, 1, query_len, dtype=torch.float16)
+                sliding_in_step = torch.zeros((1,), dtype=torch.int32)
+                global_block_idx = torch.zeros((1,), dtype=torch.int32)
+                # Blocked global mask: one (block_size, q_len) tile per block.
+                causal_mask = torch.zeros(1, n_blocks, block_size, 1, query_len, dtype=torch.float16)
+                palettization_inputs = (
+                    input_ids,
+                    position_ids,
+                    in_step,
+                    sliding_in_step,
+                    global_block_idx,
+                    causal_mask,
+                    sliding_causal_mask,
+                    key_cache,
+                    value_cache,
+                    sliding_key_cache,
+                    sliding_value_cache,
+                )
             else:
-                kv_channels = hf_config.num_key_value_heads * head_dim
-            key_cache = torch.zeros(
-                hf_config.num_hidden_layers,
-                1,  # batch_size
-                kv_channels,
-                1,
-                effective_max_ctx,
-                dtype=torch.float16,
-            )
-            value_cache = key_cache.clone()
-            palettization_inputs = (
-                input_ids,
-                position_ids,
-                in_step,
-                causal_mask,
-                key_cache,
-                value_cache,
-            )
+                if global_head_dim is not None:
+                    kv_channels = hf_config.num_key_value_heads * (head_dim + global_head_dim)
+                else:
+                    kv_channels = hf_config.num_key_value_heads * head_dim
+                key_cache = torch.zeros(
+                    hf_config.num_hidden_layers,
+                    1,  # batch_size
+                    kv_channels,
+                    1,
+                    effective_max_ctx,
+                    dtype=torch.float16,
+                )
+                value_cache = key_cache.clone()
+                palettization_inputs = (
+                    input_ids,
+                    position_ids,
+                    in_step,
+                    causal_mask,
+                    key_cache,
+                    value_cache,
+                )
             # Models with externalized Per-Layer Embeddings (Gemma4) take an
             # extra INT8 ple_embeddings arg; include it so the calibration trace
             # exercises the per-layer projection weights.

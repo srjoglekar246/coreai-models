@@ -104,7 +104,8 @@ public struct CoreAIRunner {
                 modelDefinition: .pyTorch
             ),
             serializedModel: [modelAsset],
-            function: functionName
+            function: functionName,
+            slidingWindow: bundle.slidingWindow
         )
     }
 }

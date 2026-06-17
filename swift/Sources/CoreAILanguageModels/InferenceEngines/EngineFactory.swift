@@ -81,6 +81,7 @@ public struct EngineFactory: Sendable {
         let tokenizer: String
         let function: String
         let modelDefinition: ModelSource.ModelDefinition
+        let slidingWindow: Int?
     }
 
     /// Parses config data using the unified config handler.
@@ -92,7 +93,8 @@ public struct EngineFactory: Sendable {
             maxContextLength: config.maxContextLength,
             tokenizer: config.tokenizer,
             function: config.function,
-            modelDefinition: config.resolvedModelDefinition
+            modelDefinition: config.resolvedModelDefinition,
+            slidingWindow: config.slidingWindow
         )
     }
 
@@ -189,7 +191,8 @@ public struct EngineFactory: Sendable {
                 modelDefinition: config.modelDefinition
             ),
             serializedModel: [modelURL.lastPathComponent],
-            function: config.function
+            function: config.function,
+            slidingWindow: config.slidingWindow
         )
 
         switch variant {

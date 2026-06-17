@@ -16,6 +16,7 @@ Thumbs.db
 # Build artifacts
 .build/
 default.profraw
+exports/
 
 # Python
 __pycache__/

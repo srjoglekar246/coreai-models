@@ -48,6 +48,12 @@ public enum SignpostCategory: String, Sendable {
     case cacheManagement = "CacheManagement"  // Engine layer: KV cache growth/reallocation
     case reset = "Reset"
     case cleanup = "Cleanup"
+    // Engine layer sub-spans of PrepareStep / the logits readout — fine-grained
+    // attribution of per-token runner-side (non-graph) work.
+    case gatherEmbeddings = "GatherEmbeddings"  // separate embedding-gather graph dispatch
+    case maskBuild = "MaskBuild"  // causal + sliding mask fill
+    case pleGather = "PLEGather"  // INT8 per-layer-embedding gather
+    case logitsCopy = "LogitsCopy"  // full-vocab logits copy out of the graph output
 
     /// Which group this category belongs to for table organization
     var group: CategoryGroup {
@@ -56,7 +62,8 @@ public enum SignpostCategory: String, Sendable {
             return .main
         case .prompt, .extend, .decode, .tokenization:
             return .decoder
-        case .logitsInference, .prepareStep, .cacheManagement, .sample, .sampleEncoding:
+        case .logitsInference, .prepareStep, .cacheManagement, .sample, .sampleEncoding,
+            .gatherEmbeddings, .maskBuild, .pleGather, .logitsCopy:
             return .engine
         }
     }
@@ -77,6 +84,10 @@ public enum SignpostCategory: String, Sendable {
         case .cacheManagement: return "CacheManagement"
         case .reset: return "Reset"
         case .cleanup: return "Cleanup"
+        case .gatherEmbeddings: return "GatherEmbeddings"
+        case .maskBuild: return "MaskBuild"
+        case .pleGather: return "PLEGather"
+        case .logitsCopy: return "LogitsCopy"
         }
     }
 }
@@ -651,9 +662,30 @@ public struct InstrumentsProfiler {
         return ProfileSpan(category: .cacheManagement, log: Self.log, metadata: metadata)
     }
 
+    // MARK: - PrepareStep sub-spans (fine-grained per-token runner attribution)
+
+    /// Embedding-gather graph dispatch (a separate forward per decode step).
+    public static func beginGatherEmbeddings() -> ProfileSpan {
+        ProfileSpan(category: .gatherEmbeddings, log: Self.log, metadata: [:])
+    }
+
+    /// Causal + sliding mask construction for the step.
+    public static func beginMaskBuild() -> ProfileSpan {
+        ProfileSpan(category: .maskBuild, log: Self.log, metadata: [:])
+    }
+
+    /// INT8 per-layer-embedding (PLE) gather for the step's tokens.
+    public static func beginPLEGather() -> ProfileSpan {
+        ProfileSpan(category: .pleGather, log: Self.log, metadata: [:])
+    }
+
+    /// Full-vocab logits copy out of the graph output buffer.
+    public static func beginLogitsCopy() -> ProfileSpan {
+        ProfileSpan(category: .logitsCopy, log: Self.log, metadata: [:])
+    }
+
     /// Begin profiling engine reset operations
-    public static func beginReset(engine: String? = nil) -> ProfileSpan {
-        var metadata: [String: String] = [:]
+    public static func beginReset(engine: String? = nil) -> ProfileSpan {        var metadata: [String: String] = [:]
         if let engine = engine {
             metadata["engine"] = engine
         }

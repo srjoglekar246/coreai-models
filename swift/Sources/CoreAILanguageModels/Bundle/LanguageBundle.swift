@@ -55,6 +55,9 @@ public struct LanguageBundle: Sendable {
     public var vocabSize: Int { language.vocabSize }
     public var maxContextLength: Int { language.maxContextLength }
 
+    /// Sliding-window size (Gemma4); nil for models without sliding attention.
+    public var slidingWindow: Int? { language.slidingWindow }
+
     /// Raw metadata bytes for passing to engine config parsers.
     public var rawMetadata: Data { bundle.raw }
 

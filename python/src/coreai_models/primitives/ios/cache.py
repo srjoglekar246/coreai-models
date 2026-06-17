@@ -165,64 +165,109 @@ class KVCacheHandler:
 
         return self._k_cache[layer_idx], self._v_cache[layer_idx]
 
-    def update_and_fetch_channels(
-        self: Self,
-        layer_idx: int,
+    @property
+    def k_cache(self) -> torch.Tensor:
+        return self._k_cache
+
+    @property
+    def v_cache(self) -> torch.Tensor:
+        return self._v_cache
+
+
+class BlockedKVCacheHandler:
+    """Block-outermost KV cache for large-context iOS global attention.
+
+    The flat ``KVCacheHandler`` stores the whole context on one sequence axis; at
+    large context that axis grows past the Neural Engine's supported tensor sizes
+    and the global layers fall back to the GPU. This handler gives the cache an
+    outer block dimension so the stored sequence axis is always ``block_size``
+    (≤ 8192):
+
+        state shape: [n_blocks, n_slots, hidden_size, 1, block_size]   (5D)
+
+    The rank is kept at **5D** (the always-1 batch dim is folded out) to match the
+    flat cache's layout — channel at dim 2, sequence at dim 4, same channel
+    interleave — which keeps the cache Neural-Engine-resident.
+
+    A write at absolute position ``p`` targets ``(block = p // block_size,
+    offset = p % block_size)``. Both coordinates are supplied by the caller (the
+    runner computes the block index and the in-block offset, so the graph does no
+    index arithmetic, which keeps it on the Neural Engine). ``block_size`` is a
+    multiple of every query length, so a contiguous ``q_len`` write never straddles
+    a block boundary → a plain ``mutable_slice_update`` with no wrap. The read
+    returns the whole blocked slot ``[n_blocks, hidden_size, 1, block_size]`` for
+    ``BlockedSDPA``.
+    """
+
+    def __init__(self, n_slots: int, hidden_size: int):
+        self._k_cache = None
+        self._v_cache = None
+        with torch.device("cpu"):
+            self._zero = nn.Buffer(torch.zeros(1, dtype=torch.int32), persistent=False)
+            self._one = nn.Buffer(torch.ones(1, dtype=torch.int32), persistent=False)
+            self._hidden_size = nn.Buffer(
+                torch.tensor([hidden_size], dtype=torch.int32), persistent=False
+            )
+            self._slot_indices = nn.Buffer(
+                torch.arange(n_slots, dtype=torch.int32).unsqueeze(1), persistent=False
+            )
+            self._slot_indices_end = nn.Buffer(
+                torch.arange(1, n_slots + 1, dtype=torch.int32).unsqueeze(1),
+                persistent=False,
+            )
+
+    def register_kv_cache(self, key_cache: torch.Tensor, value_cache: torch.Tensor):
+        assert isinstance(key_cache, torch.Tensor) and isinstance(value_cache, torch.Tensor)
+        assert key_cache.shape == value_cache.shape, (
+            f"key/value blocked cache shape mismatch: {key_cache.shape} vs {value_cache.shape}"
+        )
+        assert key_cache.dim() == 5, (
+            f"blocked cache must be 5D [n_blocks,n_slots,C,1,block_size], got {key_cache.shape}"
+        )
+        self._k_cache = key_cache
+        self._v_cache = value_cache
+
+    def gen_slice_args(
+        self,
+        slot: int,
+        block_idx: torch.IntTensor,
+        offset: torch.IntTensor,
+        num_token_updates: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        slot_index = self._slot_indices[slot]
+        slot_index_end = self._slot_indices_end[slot]
+        begin = torch.cat([block_idx, slot_index, self._zero, self._zero, offset])
+        end = torch.cat(
+            [
+                block_idx + self._one,
+                slot_index_end,
+                self._hidden_size,
+                self._one,
+                offset + num_token_updates,
+            ]
+        )
+        return begin, end
+
+    def update_and_fetch(
+        self,
+        slot: int,
+        block_idx: torch.IntTensor,
         offset: torch.IntTensor,
         k: torch.Tensor,
         v: torch.Tensor,
         num_token_updates: int,
-        channel_begin: int,
-        channel_end: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Update a channel sub-range of the KV cache for a specific layer.
-
-        Used when sliding and global KV caches are merged along the channel
-        dimension into a single buffer. Each attention layer writes to its
-        own channel slice.
-
-        Args:
-            layer_idx: Index of the transformer layer.
-            offset: Starting position in the sequence dimension for the update.
-            k: New key tensor to insert, shape (batch, channels, 1, seq).
-            v: New value tensor to insert, shape (batch, channels, 1, seq).
-            num_token_updates: Number of tokens being updated.
-            channel_begin: Start index of the channel sub-range (inclusive).
-            channel_end: End index of the channel sub-range (exclusive).
-
-        Returns:
-            Tuple of (key_cache_slice, value_cache_slice) for the specified
-            layer and channel range.
-        """
+        """Write the ``q_len`` new K/V into ``(block_idx, slot, :, :, offset:offset+q)``
+        and return the whole blocked slot ``[n_blocks, C, 1, block_size]``."""
         assert self._k_cache is not None and self._v_cache is not None, (
-            "Cannot call update_and_fetch_channels before registering key/value cache!"
+            "Cannot call update_and_fetch before registering key/value cache!"
         )
-
-        torch._check_is_size(layer_idx, message="int layer index >= 0")
-        torch._check(
-            layer_idx < self._k_cache.size(0),
-            message="layer index < number of transformer layers",
-        )
-        torch._check(
-            layer_idx < self._v_cache.size(0),
-            message="layer index < number of transformer layers",
-        )
-
-        layer_index = self._layer_indices[layer_idx]
-        layer_index_end = self._layer_indices_end[layer_idx]
-        ch_begin = torch.tensor((channel_begin,), dtype=torch.int32)
-        ch_end = torch.tensor((channel_end,), dtype=torch.int32)
-
-        begin = torch.cat([layer_index, self._zero, ch_begin, self._zero, offset])
-        end = torch.cat([layer_index_end, self._one, ch_end, self._one, offset + num_token_updates])
-
+        begin, end = self.gen_slice_args(slot, block_idx, offset, num_token_updates)
+        # k/v are BC1S (1, C, 1, q_len); the 5D cache region is
+        # (1 block, 1 slot, C, 1, q_len), so add the leading block dim.
         mutable_slice_update(x=self._k_cache, update=k.unsqueeze(0), begin=begin, end=end)
         mutable_slice_update(x=self._v_cache, update=v.unsqueeze(0), begin=begin, end=end)
-
-        return (
-            self._k_cache[layer_idx, :, channel_begin:channel_end, :, :],
-            self._v_cache[layer_idx, :, channel_begin:channel_end, :, :],
-        )
+        return self._k_cache[:, slot], self._v_cache[:, slot]
 
     @property
     def k_cache(self) -> torch.Tensor:

@@ -18,6 +18,15 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     private static let logitsOutputName = "out_logits"
     private static let keyCacheName = "key_cache"
     private static let valueCacheName = "value_cache"
+    private static let slidingKeyCacheName = "sliding_key_cache"
+    private static let slidingValueCacheName = "sliding_value_cache"
+    private static let slidingCausalMaskName = "sliding_causal_mask"
+    private static let slidingInStepName = "sliding_in_step"
+    private static let causalMaskName = "causal_mask"
+    // Blocked global cache (Gemma4 large-context): the runner-provided destination
+    // block index for the global cache write (= in_step / block_size). The in-block
+    // offset is supplied separately (via in_step), so the graph does no index math.
+    private static let globalBlockIdxName = "global_block_idx"
 
     public var vocabSize: Int { config.vocabSize }
 
@@ -45,9 +54,18 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     // Largest query length across all extend functions — used as prefill threshold.
     private let maxQueryLength: Int
 
-    // Fixed size caches shared across all decoding functions.
+    // Fixed-size state caches (IOSurface). Every model has key/value; Gemma4
+    // also has a sliding-window ring. Kept as separate stored properties (not a
+    // dict) so each view borrows distinct, instance-lifetime storage. When the
+    // model has no sliding cache, the sliding properties alias key/value and are
+    // never bound (gated by `hasSlidingCache`).
     private var keyCache: NDArray
     private var valueCache: NDArray
+    private var slidingKeyCache: NDArray
+    private var slidingValueCache: NDArray
+    private let hasSlidingCache: Bool
+    // Sliding-cache ring depth S (last dim of the sliding cache); 0 when absent.
+    private let slidingRingDepth: Int
 
     // Number of tokens already processed in the current sequence.
     private var processedTokenCount: Int = 0
@@ -119,18 +137,36 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             self.perLayerEmbeddings = nil
         }
 
-        // Allocate KV cache IOSurfaces sized to the max-context descriptor
-        if case .ndArray(let keyCacheDescriptor) = largestExtendDescriptor.stateDescriptor(of: Self.keyCacheName),
-            case .ndArray(let valueCacheDescriptor) = largestExtendDescriptor.stateDescriptor(of: Self.valueCacheName)
-        {
-            self.keyCache = NDArray(descriptor: keyCacheDescriptor)
-            self.valueCache = NDArray(descriptor: valueCacheDescriptor)
-            CLILogger.log(
-                "KV cache allocated: key \(keyCacheDescriptor.minimumByteCount) bytes, value \(valueCacheDescriptor.minimumByteCount) bytes (IOSurface)"
-            )
-        } else {
+        // Allocate one IOSurface NDArray per state, sized to the max-context
+        // descriptor. Single-cache models get key/value; Gemma4 also gets the
+        // fixed-depth sliding ring.
+        func allocateState(_ name: String) -> NDArray? {
+            guard case .ndArray(let d) = largestExtendDescriptor.stateDescriptor(of: name) else {
+                return nil
+            }
+            CLILogger.log("Cache '\(name)' allocated: \(d.minimumByteCount) bytes (IOSurface)")
+            return NDArray(descriptor: d)
+        }
+        guard let key = allocateState(Self.keyCacheName),
+            let value = allocateState(Self.valueCacheName)
+        else {
             throw InferenceRuntimeError.invalidState(
                 "No KV cache state descriptors found — cannot allocate cache buffers")
+        }
+        self.keyCache = key
+        self.valueCache = value
+        // Sliding ring (Gemma4). Absent on other models — alias key/value as an
+        // unused placeholder so the properties stay non-optional and bindable.
+        let slidingKey = allocateState(Self.slidingKeyCacheName)
+        let slidingValue = allocateState(Self.slidingValueCacheName)
+        self.hasSlidingCache = slidingKey != nil && slidingValue != nil
+        self.slidingKeyCache = slidingKey ?? key
+        self.slidingValueCache = slidingValue ?? value
+        // Ring depth S = the sliding cache's sequence (last) dimension.
+        if case .ndArray(let sd) = largestExtendDescriptor.stateDescriptor(of: Self.slidingKeyCacheName) {
+            self.slidingRingDepth = sd.shape.last ?? 0
+        } else {
+            self.slidingRingDepth = 0
         }
 
         CLILogger.log("Engine initialized")
@@ -279,6 +315,20 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     private static func contextLength(
         descriptor: InferenceFunctionDescriptor, config: ModelConfig
     ) -> Int {
+        // Blocked global cache (Gemma4 large-context): the global cache is 5D
+        // [n_blocks, n_slots, C, 1, block_size] and the blocked causal_mask is 5D
+        // (1, n_blocks, block_size, 1, q_len). The total context is n_blocks *
+        // block_size, not the last (block_size) dim. The rank-5 causal_mask is the
+        // unambiguous signal that this is the blocked layout.
+        if case .ndArray(let maskDesc) = descriptor.inputDescriptor(of: causalMaskName),
+            maskDesc.shape.count == 5,
+            case .ndArray(let keyDesc) = descriptor.stateDescriptor(of: keyCacheName),
+            !keyDesc.shape.contains(-1)
+        {
+            let nBlocks = keyDesc.shape.first ?? 1
+            let blockSize = keyDesc.shape.last ?? config.maxContextLength
+            return nBlocks * blockSize
+        }
         if case .ndArray(let keyDesc) = descriptor.stateDescriptor(of: keyCacheName) {
             // A dynamic (-1) last dim can't be a concrete context length; fall
             // back to the configured max so function selection still matches.
@@ -350,6 +400,82 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
                 for context in 0...upperBound {
                     let offset = context &* strides[1] &+ query &* strides[3]
                     ptr[offset] = 0
+                }
+            }
+        }
+    }
+
+    /// Builds the sliding-window mask `(1, S, 1, q_len)` for the ring cache.
+    ///
+    /// The sliding cache is a ring of depth `S` (= `shape[1]`): the key/value for
+    /// absolute position `p` lives at slot `p % S`. For each query at position
+    /// `p = alignedStep + query` we unmask exactly the in-window causal keys —
+    /// positions `[max(0, p - window + 1), p]` — at their ring slots. Because
+    /// `S >= window + q_len - 1`, those `window` positions map to distinct slots
+    /// (no collisions) and keys written by later queries in the same chunk stay
+    /// masked. Everything else is -40000 (fp16-safe -inf).
+    private static func fillSlidingMask(
+        _ view: inout NDArray.MutableView<LogitsScalarType>,
+        tokensInBatch: Int,
+        alignedStep: Int,
+        window: Int
+    ) {
+        view.withUnsafeMutablePointer { ptr, shape, strides in
+            let ringDepth = shape[1]
+            for context in 0..<shape[1] {
+                for query in 0..<shape[3] {
+                    let offset = context &* strides[1] &+ query &* strides[3]
+                    ptr[offset] = LogitsScalarType(-40000.0)
+                }
+            }
+
+            for query in 0..<tokensInBatch {
+                let queryPos = alignedStep + query
+                let lowerPos = max(0, queryPos &- window &+ 1)
+                for pos in lowerPos...queryPos {
+                    let slot = pos % ringDepth
+                    let offset = slot &* strides[1] &+ query &* strides[3]
+                    ptr[offset] = 0
+                }
+            }
+        }
+    }
+
+    /// Builds the blocked global causal mask `(1, n_blocks, block_size, 1, q_len)`
+    /// for the blocked global cache. Key `(block t, j)` holds
+    /// absolute position `t*block_size + j`; for a query at `p = alignedStep + query`
+    /// it is unmasked (full causal) iff `t*block_size + j <= p`. Everything else is
+    /// -40000 (fp16-safe -inf), including padding in not-yet-written blocks.
+    private static func fillBlockedCausalMask(
+        _ view: inout NDArray.MutableView<LogitsScalarType>,
+        tokensInBatch: Int,
+        alignedStep: Int
+    ) {
+        view.withUnsafeMutablePointer { ptr, shape, strides in
+            // shape: (1, n_blocks, block_size, 1, q_len)
+            let nBlocks = shape[1]
+            let blockSize = shape[2]
+            let qLen = shape[4]
+            for b in 0..<nBlocks {
+                for j in 0..<blockSize {
+                    let base = b &* strides[1] &+ j &* strides[2]
+                    for query in 0..<qLen {
+                        ptr[base &+ query &* strides[4]] = LogitsScalarType(-40000.0)
+                    }
+                }
+            }
+            // Unmask the causal prefix [0, queryPos] at each key's (block, offset).
+            let maxKey = nBlocks &* blockSize &- 1
+            for query in 0..<tokensInBatch {
+                let queryPos = alignedStep &+ query
+                let upper = min(queryPos, maxKey)
+                var key = 0
+                while key <= upper {
+                    let b = key / blockSize
+                    let j = key % blockSize
+                    let offset = b &* strides[1] &+ j &* strides[2] &+ query &* strides[4]
+                    ptr[offset] = 0
+                    key &+= 1
                 }
             }
         }
@@ -450,32 +576,62 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             let fn = try loadFunction(named: graphName)
             let desc = try functionDescriptor(for: graphName)
 
+            // Bind every state this function declares from its persistent cache.
+            // All extend functions share cache shape/strides/interleave per state,
+            // so no copy is needed on graph switch — we slice to this function's
+            // descriptor shape (e.g. the global cache's smaller cache_len window).
+            // Bind every state this function declares from its persistent cache.
+            // Views alias the instance-lifetime IOSurface backing (no copy on
+            // graph switch), sliced to this function's descriptor shape (e.g.
+            // the global cache's smaller cache_len window).
             guard case .ndArray(let keyCacheDescriptor) = desc.stateDescriptor(of: Self.keyCacheName),
                 case .ndArray(let valueCacheDescriptor) = desc.stateDescriptor(of: Self.valueCacheName)
             else {
                 throw InferenceRuntimeError.invalidState("Missing KV cache state descriptors for '\(graphName)'")
             }
 
-            // Create MutableRawView using this function's descriptor for shape metadata.
-            // No copy is needed on graph switch because all extend functions share the
-            // same KV cache shape, strides, and interleaveLayout
-            let keyCacheView = keyCache.mutableRawView().slice(at: keyCacheDescriptor.shape.map { 0..<$0 })
-            let valueCacheView = valueCache.mutableRawView().slice(at: valueCacheDescriptor.shape.map { 0..<$0 })
-
-            var states = InferenceFunction.MutableViews()
-            states.insert(keyCacheView, for: Self.keyCacheName)
-            states.insert(valueCacheView, for: Self.valueCacheName)
-            var outputs = try await fn.run(
-                inputs: inputs,
-                states: consume states,
-                outputViews: InferenceFunction.MutableViews()
-            )
+            // Build state views and run. Each branch keeps the view borrows and
+            // the run() call in one straight-line scope (a lifetime-dependent
+            // view can't be inserted into an outer-scope `states` from inside a
+            // nested block), so the sliding case is its own branch.
+            var outputs: InferenceFunction.Outputs
+            if hasSlidingCache,
+                case .ndArray(let slidingKeyDescriptor) = desc.stateDescriptor(of: Self.slidingKeyCacheName),
+                case .ndArray(let slidingValueDescriptor) = desc.stateDescriptor(of: Self.slidingValueCacheName)
+            {
+                var states = InferenceFunction.MutableViews()
+                states.insert(
+                    keyCache.mutableRawView().slice(at: keyCacheDescriptor.shape.map { 0..<$0 }),
+                    for: Self.keyCacheName)
+                states.insert(
+                    valueCache.mutableRawView().slice(at: valueCacheDescriptor.shape.map { 0..<$0 }),
+                    for: Self.valueCacheName)
+                states.insert(
+                    slidingKeyCache.mutableRawView().slice(at: slidingKeyDescriptor.shape.map { 0..<$0 }),
+                    for: Self.slidingKeyCacheName)
+                states.insert(
+                    slidingValueCache.mutableRawView().slice(at: slidingValueDescriptor.shape.map { 0..<$0 }),
+                    for: Self.slidingValueCacheName)
+                outputs = try await fn.run(
+                    inputs: inputs, states: consume states, outputViews: InferenceFunction.MutableViews())
+            } else {
+                var states = InferenceFunction.MutableViews()
+                states.insert(
+                    keyCache.mutableRawView().slice(at: keyCacheDescriptor.shape.map { 0..<$0 }),
+                    for: Self.keyCacheName)
+                states.insert(
+                    valueCache.mutableRawView().slice(at: valueCacheDescriptor.shape.map { 0..<$0 }),
+                    for: Self.valueCacheName)
+                outputs = try await fn.run(
+                    inputs: inputs, states: consume states, outputViews: InferenceFunction.MutableViews())
+            }
 
             let logitsArray = outputs.remove(Self.logitsOutputName)?.ndArray
             logitsSpan.end()
 
             // Extract logits from the last token position.
             if !usePrefill, let logitsArray {
+                let copySpan = InstrumentsProfiler.beginLogitsCopy()
                 let logitsView = logitsArray.view(as: LogitsScalarType.self)
                 guard let logits = logitsView.contiguousElements else {
                     throw InferenceRuntimeError.invalidState(
@@ -485,6 +641,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
                 for i in 0..<config.vocabSize {
                     logitBuffer[i] = logits[offset + i]
                 }
+                copySpan.end()
             }
 
             currentPosition = batchEndToken + 1
@@ -511,6 +668,16 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         let desc = try functionDescriptor(for: graphName)
         var inputs = [String: NDArray]()
 
+        // Block size for the blocked global cache (0 if not a blocked Gemma4 graph).
+        // Read from the rank-5 blocked causal_mask descriptor
+        // (1, n_blocks, block_size, 1, q_len). Used to pre-split the global write
+        // coords (block index + in-block offset) in the runner so the graph does no
+        // index arithmetic, which keeps it on the Neural Engine.
+        var globalBlockSize = 0
+        if case .ndArray(let m) = desc.inputDescriptor(of: Self.causalMaskName), m.shape.count == 5 {
+            globalBlockSize = m.shape[2]
+        }
+
         if desc.inputNames.contains("embedding_table") {
             inputs["embedding_table"] = embeddingTable
         }
@@ -522,12 +689,14 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
                 throw InferenceRuntimeError.invalidState(
                     "No gather function '\(gatherName)' for batch size \(batchSize)")
             }
-            guard let gathered = try await runGather(tokenIDs: Array(batchTokens), batchSize: batchSize) else {
+            let gatherSpan = InstrumentsProfiler.beginGatherEmbeddings()
+            let gatheredOpt = try await runGather(tokenIDs: Array(batchTokens), batchSize: batchSize)
+            gatherSpan.end()
+            guard let gathered = gatheredOpt else {
                 throw InferenceRuntimeError.invalidState("Gather '\(gatherName)' returned no output")
             }
             inputs[txName] = gathered
         }
-
         // Position IDs
         guard let posName = desc.inputNames.first(where: { $0.contains("pos") }) else {
             throw InferenceRuntimeError.invalidState("Graph '\(graphName)' has no position_ids input")
@@ -545,24 +714,78 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         }
 
         // Causal mask
-        if case .ndArray(let nd) = desc.inputDescriptor(of: "causal_mask") {
+        let maskSpan = InstrumentsProfiler.beginMaskBuild()
+        if case .ndArray(let nd) = desc.inputDescriptor(of: Self.causalMaskName) {
             var mask = NDArray(descriptor: nd)
             var maskView = mask.mutableView(as: LogitsScalarType.self)
-            Self.fillCausalMask(&maskView, tokensInBatch: tokensInBatch, alignedStep: alignedStep)
-            inputs["causal_mask"] = mask
+            if nd.shape.count == 5 {
+                // Blocked global mask (1, n_blocks, block_size, 1, q_len).
+                Self.fillBlockedCausalMask(
+                    &maskView, tokensInBatch: tokensInBatch, alignedStep: alignedStep)
+            } else {
+                Self.fillCausalMask(&maskView, tokensInBatch: tokensInBatch, alignedStep: alignedStep)
+            }
+            inputs[Self.causalMaskName] = mask
         }
 
-        // Step
-        if let stepName = desc.inputNames.first(where: { $0.contains("step") && !$0.contains("pos") }),
-            case .ndArray(let nd) = desc.inputDescriptor(of: stepName)
-        {
+        // Sliding-window mask (Gemma4): like the causal mask but limited to the
+        // last `window` keys and indexed into the ring by absolute position % S.
+        if case .ndArray(let nd) = desc.inputDescriptor(of: Self.slidingCausalMaskName) {
+            guard let window = config.slidingWindow else {
+                throw InferenceRuntimeError.invalidState(
+                    "Graph '\(graphName)' wants '\(Self.slidingCausalMaskName)' "
+                        + "but the model config has no sliding_window")
+            }
+            var mask = NDArray(descriptor: nd)
+            var maskView = mask.mutableView(as: LogitsScalarType.self)
+            Self.fillSlidingMask(
+                &maskView, tokensInBatch: tokensInBatch, alignedStep: alignedStep, window: window)
+            inputs[Self.slidingCausalMaskName] = mask
+        }
+        maskSpan.end()
+
+        // Step(s). Models have `in_step` (absolute write offset). Gemma4 also has
+        // `sliding_in_step` = alignedStep % S, the sliding ring write offset
+        // (computed here so the graph needs no remainder op, which the ANE
+        // compiler can't lower). Both inputs match `*step*`, so set each by name.
+        for stepName in desc.inputNames where stepName.contains("step") && !stepName.contains("pos") {
+            guard case .ndArray(let nd) = desc.inputDescriptor(of: stepName) else { continue }
             var step = NDArray(descriptor: nd)
             var stepView = step.mutableView(as: Int32.self)
             guard var stepSpan = stepView.contiguousElements else {
                 throw InferenceRuntimeError.invalidState("step array has non-contiguous layout")
             }
-            stepSpan[0] = Int32(alignedStep)
+            if stepName == Self.slidingInStepName {
+                stepSpan[0] = Int32(slidingRingDepth > 0 ? alignedStep % slidingRingDepth : alignedStep)
+            } else if globalBlockSize > 0 {
+                // Blocked global cache: in_step carries the in-block write offset
+                // (alignedStep % block_size); the destination block is sent
+                // separately as global_block_idx. Pre-split here so the graph needs
+                // no division/modulo and stays on the Neural Engine.
+                stepSpan[0] = Int32(alignedStep % globalBlockSize)
+            } else {
+                stepSpan[0] = Int32(alignedStep)
+            }
             inputs[stepName] = step
+        }
+
+        // Global block index (Gemma4 blocked global cache): the destination block
+        // for this batch's write = alignedStep / block_size.
+        if desc.inputNames.contains(Self.globalBlockIdxName),
+            case .ndArray(let nd) = desc.inputDescriptor(of: Self.globalBlockIdxName)
+        {
+            guard globalBlockSize > 0 else {
+                throw InferenceRuntimeError.invalidState(
+                    "Graph '\(graphName)' has '\(Self.globalBlockIdxName)' but no rank-5 "
+                        + "blocked causal_mask to derive block_size from")
+            }
+            var blockIdx = NDArray(descriptor: nd)
+            var blockIdxView = blockIdx.mutableView(as: Int32.self)
+            guard var blockIdxSpan = blockIdxView.contiguousElements else {
+                throw InferenceRuntimeError.invalidState("global_block_idx array has non-contiguous layout")
+            }
+            blockIdxSpan[0] = Int32(alignedStep / globalBlockSize)
+            inputs[Self.globalBlockIdxName] = blockIdx
         }
 
         // Per-Layer Embeddings (Gemma4): gather INT8 rows for this batch's tokens.
@@ -588,11 +811,13 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
                 throw InferenceRuntimeError.invalidState(
                     "ple_embeddings array has non-contiguous layout")
             }
+            let pleSpan = InstrumentsProfiler.beginPLEGather()
             pleView.withUnsafeMutablePointer { ptr, _, _ in
                 ptr.update(repeating: 0, count: elementCount)
                 let buf = UnsafeMutableBufferPointer(start: ptr, count: elementCount)
                 ple.gather(tokenIDs: Array(batchTokens), batchSize: batchSize, into: buf)
             }
+            pleSpan.end()
             inputs[Self.pleInputName] = pleArray
         }
 

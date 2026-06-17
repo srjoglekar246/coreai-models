@@ -99,6 +99,13 @@ def _write_metadata(
     if per_layer_embeddings is not None:
         language["per_layer_embeddings"] = per_layer_embeddings
 
+    # Sliding-window size, needed by the runner to build the windowed mask for
+    # models with a sliding KV cache (Gemma4). Harmless for others — the runner
+    # only consults it when the graph declares a ``sliding_causal_mask`` input.
+    sliding_window = getattr(text_config, "sliding_window", None)
+    if isinstance(sliding_window, int) and sliding_window > 0:
+        language["sliding_window"] = sliding_window
+
     # End-of-generation token ids. The tokenizer exposes only a single
     # ``eos_token`` (e.g. ``<eos>``), but Gemma chat models stop on additional
     # tokens (``<end_of_turn>``) that the tokenizer's eos doesn't cover. Carry

@@ -65,6 +65,10 @@ public struct ModelConfig: InferenceConfiguration, Codable, Sendable {
     // Static-shape-specific (optional)
     var inputMode: InputMode?
 
+    /// Sliding-window size for models with a sliding KV cache (Gemma4). Used by
+    /// the static-shape engine to build the windowed `sliding_causal_mask`.
+    public var slidingWindow: Int?
+
     public enum InputMode: String, Codable, Sendable {
         case random
         case allZeros = "all-zeros"
@@ -78,7 +82,8 @@ public struct ModelConfig: InferenceConfiguration, Codable, Sendable {
         source: ModelSource? = nil,
         serializedModel: [String],
         function: String,
-        inputMode: InputMode? = nil
+        inputMode: InputMode? = nil,
+        slidingWindow: Int? = nil
     ) {
         self.name = name
         self.tokenizer = tokenizer
@@ -88,6 +93,7 @@ public struct ModelConfig: InferenceConfiguration, Codable, Sendable {
         self.serializedModel = serializedModel
         self.function = function
         self.inputMode = inputMode
+        self.slidingWindow = slidingWindow
     }
 
     enum CodingKeys: String, CodingKey {
@@ -99,6 +105,7 @@ public struct ModelConfig: InferenceConfiguration, Codable, Sendable {
         case serializedModel = "serialized_model"
         case function
         case inputMode = "input_mode"
+        case slidingWindow = "sliding_window"
     }
 
     public init(from decoder: Decoder) throws {
@@ -111,6 +118,7 @@ public struct ModelConfig: InferenceConfiguration, Codable, Sendable {
         self.serializedModel = try c.decode([String].self, forKey: .serializedModel)
         self.function = try c.decodeIfPresent(String.self, forKey: .function) ?? "main"
         self.inputMode = try c.decodeIfPresent(InputMode.self, forKey: .inputMode)
+        self.slidingWindow = try c.decodeIfPresent(Int.self, forKey: .slidingWindow)
     }
 }
 
