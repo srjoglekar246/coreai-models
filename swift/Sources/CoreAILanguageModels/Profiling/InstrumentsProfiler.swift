@@ -52,6 +52,7 @@ public enum SignpostCategory: String, Sendable {
     // attribution of per-token runner-side (non-graph) work.
     case gatherEmbeddings = "GatherEmbeddings"  // separate embedding-gather graph dispatch
     case maskBuild = "MaskBuild"  // causal + sliding mask fill
+    case ropeBuild = "RopeBuild"  // runner-side RoPE cos/sin precompute (Gemma4)
     case pleGather = "PLEGather"  // INT8 per-layer-embedding gather
     case logitsCopy = "LogitsCopy"  // full-vocab logits copy out of the graph output
 
@@ -63,7 +64,7 @@ public enum SignpostCategory: String, Sendable {
         case .prompt, .extend, .decode, .tokenization:
             return .decoder
         case .logitsInference, .prepareStep, .cacheManagement, .sample, .sampleEncoding,
-            .gatherEmbeddings, .maskBuild, .pleGather, .logitsCopy:
+            .gatherEmbeddings, .maskBuild, .ropeBuild, .pleGather, .logitsCopy:
             return .engine
         }
     }
@@ -86,6 +87,7 @@ public enum SignpostCategory: String, Sendable {
         case .cleanup: return "Cleanup"
         case .gatherEmbeddings: return "GatherEmbeddings"
         case .maskBuild: return "MaskBuild"
+        case .ropeBuild: return "RopeBuild"
         case .pleGather: return "PLEGather"
         case .logitsCopy: return "LogitsCopy"
         }
@@ -672,6 +674,11 @@ public struct InstrumentsProfiler {
     /// Causal + sliding mask construction for the step.
     public static func beginMaskBuild() -> ProfileSpan {
         ProfileSpan(category: .maskBuild, log: Self.log, metadata: [:])
+    }
+
+    /// Runner-side RoPE cos/sin precompute for the step's tokens (Gemma4).
+    public static func beginRopeBuild() -> ProfileSpan {
+        ProfileSpan(category: .ropeBuild, log: Self.log, metadata: [:])
     }
 
     /// INT8 per-layer-embedding (PLE) gather for the step's tokens.

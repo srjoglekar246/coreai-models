@@ -58,6 +58,10 @@ public struct LanguageBundle: Sendable {
     /// Sliding-window size (Gemma4); nil for models without sliding attention.
     public var slidingWindow: Int? { language.slidingWindow }
 
+    /// Dual-RoPE parameters (Gemma4 large-context); nil when RoPE is gathered
+    /// in-graph from `position_ids`.
+    public var rope: RoPEConfig? { language.rope }
+
     /// Raw metadata bytes for passing to engine config parsers.
     public var rawMetadata: Data { bundle.raw }
 

@@ -82,6 +82,7 @@ public struct EngineFactory: Sendable {
         let function: String
         let modelDefinition: ModelSource.ModelDefinition
         let slidingWindow: Int?
+        let rope: RoPEConfig?
     }
 
     /// Parses config data using the unified config handler.
@@ -94,7 +95,8 @@ public struct EngineFactory: Sendable {
             tokenizer: config.tokenizer,
             function: config.function,
             modelDefinition: config.resolvedModelDefinition,
-            slidingWindow: config.slidingWindow
+            slidingWindow: config.slidingWindow,
+            rope: config.rope
         )
     }
 
@@ -192,7 +194,8 @@ public struct EngineFactory: Sendable {
             ),
             serializedModel: [modelURL.lastPathComponent],
             function: config.function,
-            slidingWindow: config.slidingWindow
+            slidingWindow: config.slidingWindow,
+            rope: config.rope
         )
 
         switch variant {

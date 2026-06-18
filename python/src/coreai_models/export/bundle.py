@@ -106,6 +106,29 @@ def _write_metadata(
     if isinstance(sliding_window, int) and sliding_window > 0:
         language["sliding_window"] = sliding_window
 
+    # Dual-RoPE parameters for models that precompute cos/sin in the runner
+    # (Gemma4 large-context): the graph takes ``rope_cos``/``rope_sin`` instead of
+    # ``position_ids`` (a 131k position overflows a 16-bit input and a 32-bit input
+    # crashes the MPSGraph streaming compiler). The runner needs the two head dims,
+    # the two RoPE bases, and the global partial-rotary factor to build the combined
+    # table rows. Emitted only when the model declares the Gemma4 dual-RoPE config.
+    rope_parameters = getattr(text_config, "rope_parameters", None)
+    global_head_dim = getattr(text_config, "global_head_dim", None)
+    if (
+        isinstance(rope_parameters, dict)
+        and "sliding_attention" in rope_parameters
+        and "full_attention" in rope_parameters
+        and isinstance(global_head_dim, int)
+    ):
+        full = rope_parameters["full_attention"]
+        language["rope"] = {
+            "sliding_head_dim": text_config.head_dim,
+            "global_head_dim": global_head_dim,
+            "sliding_rope_theta": rope_parameters["sliding_attention"]["rope_theta"],
+            "global_rope_theta": full["rope_theta"],
+            "partial_rotary_factor": full.get("partial_rotary_factor", 0.25),
+        }
+
     # End-of-generation token ids. The tokenizer exposes only a single
     # ``eos_token`` (e.g. ``<eos>``), but Gemma chat models stop on additional
     # tokens (``<end_of_turn>``) that the tokenizer's eos doesn't cover. Carry

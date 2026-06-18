@@ -29,7 +29,7 @@ import torch.nn as nn
 from safetensors.torch import save_file
 
 from coreai_models.models.base import BaseForCausalLMForiOS
-from coreai_models.primitives.ios.cache import BlockedKVCacheHandler, KVCacheHandler
+from coreai_models.primitives.ios.cache import KVCacheHandler
 from coreai_models.primitives.ios.quantization import (
     dequantize_per_tensor,
     quantize_per_tensor,
@@ -38,11 +38,11 @@ from coreai_models.primitives.ios.rms_norm import RMSNorm
 from coreai_models.primitives.ios.rope import RoPECache, apply_rope
 from coreai_models.primitives.ios.sdpa import SDPA, BlockedSDPA
 
-# Default block size for the blocked global KV cache: the largest block that keeps
-# each global-attention tensor within the Neural Engine's supported tensor sizes.
-# Overridable via the config attribute ``kv_block_size`` (tests use a small value to
-# exercise multiple blocks cheaply). Must be a multiple of max(QUERY_LENGTHS) for the
-# no-straddle write.
+# Flash chunk width for the global (full-attention) ``BlockedSDPA`` over the flat cache:
+# the largest key-axis chunk whose per-block score/softmax stays within the Neural
+# Engine's supported sizes; 8192 is the empirically-proven value on h16c. Overridable via
+# the config attribute ``kv_block_size`` (tests use a small value to exercise multiple
+# chunks cheaply). Must be a multiple of max(QUERY_LENGTHS) for the no-straddle write.
 DEFAULT_KV_BLOCK_SIZE = 8192
 
 
@@ -161,9 +161,10 @@ class Attention(nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.is_sliding = is_sliding
-        # Global (full-attention) layers use the blocked global cache + flash SDPA
-        # so each attention tensor stays within one Neural-Engine-safe block.
-        # Sliding layers use the fixed S=576 ring and the flat SDPA, unchanged.
+        # Both caches are flat. Global (full-attention) layers run the chunked flash
+        # ``BlockedSDPA`` over the flat slot (block_size chunks keep the score key-axis
+        # ANE-safe up to ctx ~32768); sliding layers use the small S=576 ring + flat
+        # ``SDPA``. ``BlockedSDPA``/``SDPA`` share the same (q, k, v, mask) signature.
         self.is_blocked = not is_sliding
         self.is_kv_shared = is_kv_shared
         # Slot in this layer's type-specific cache: the read+write slot for
@@ -176,7 +177,8 @@ class Attention(nn.Module):
         self.head_dim = config.head_dim if is_sliding else config.global_head_dim
 
         if self.is_blocked:
-            self.sdpa = BlockedSDPA(head_dim=self.head_dim, scale=1.0)
+            block_size = getattr(config, "kv_block_size", None) or DEFAULT_KV_BLOCK_SIZE
+            self.sdpa = BlockedSDPA(head_dim=self.head_dim, scale=1.0, block_size=block_size)
         else:
             self.sdpa = SDPA(head_dim=self.head_dim, scale=1.0)
 
@@ -197,18 +199,18 @@ class Attention(nn.Module):
         rope_cos: torch.Tensor,
         rope_sin: torch.Tensor,
         write_offset: torch.IntTensor,
-        block_idx: torch.IntTensor | None,
         causal_mask: torch.Tensor,
-        cache: KVCacheHandler | BlockedKVCacheHandler | None = None,
+        cache: KVCacheHandler | None = None,
     ) -> torch.Tensor:
         """Attention for one layer.
 
-        ``write_offset`` is the write position into this layer's cache: the ring
-        offset (``in_step % S``) for sliding layers, the in-block offset
-        (``in_step % block_size``) for global layers. ``block_idx`` (global only)
-        is the destination block ``in_step // block_size``; ``None`` for sliding.
-        ``causal_mask`` is the flat ``(1, S, 1, q_len)`` sliding mask or the blocked
-        ``(1, n_blocks, block_size, 1, q_len)`` global mask.
+        ``write_offset`` is the dynamic flat write offset into this layer's cache: the
+        ring offset (``in_step % S``) for sliding layers, the absolute position
+        (``in_step``) for global layers — a SINGLE dynamic offset into a flat cache (no
+        block index), so each region has ≤1 dynamic-offset LiveInParam.
+        ``causal_mask`` is the flat ``(1, S, 1, q_len)`` sliding mask or the flat
+        ``(1, ctx, 1, q_len)`` global mask; global layers walk it in block_size chunks
+        inside ``BlockedSDPA``.
         """
         batch_size, query_len, _, hidden_size = x.shape
         n_heads, n_kv_heads = self.n_heads, self.n_kv_heads
@@ -228,15 +230,10 @@ class Attention(nn.Module):
             assert cache is not None
             # Reshape Q back to BC1S for SDPA
             query = query.reshape(batch_size, query_len, 1, n_heads * head_dim).transpose(-3, -1)
-            # Read the whole cache from the source layer's slot (read-only). The
-            # global blocked cache returns all blocks (n_blocks,1,C,1,B); the
-            # sliding cache returns the flat ring (1,C,1,S).
-            if self.is_blocked:
-                key = cache.k_cache[:, self.slot]
-                value = cache.v_cache[:, self.slot]
-            else:
-                key = cache.k_cache[self.slot]
-                value = cache.v_cache[self.slot]
+            # Read the whole flat cache slot from the source layer (read-only):
+            # (1, C, 1, seq) for both sliding (seq=S) and global (seq=ctx).
+            key = cache.k_cache[self.slot]
+            value = cache.v_cache[self.slot]
             output = self.sdpa(query, key, value, causal_mask)
         else:
             key = self.k_proj(x_conv)
@@ -256,21 +253,13 @@ class Attention(nn.Module):
             value = value.reshape(batch_size, query_len, 1, n_kv_heads * head_dim).transpose(-3, -1)
 
             if cache is not None:
-                # The write offset (``write_offset``) is supplied by the caller:
-                # the ring offset (in_step % S) for sliding layers, the in-block
-                # offset (in_step % block_size) for global layers. The modulo is
-                # computed outside the graph (in the runner) and passed in, so the
-                # graph does no index arithmetic and stays on the Neural Engine. S
-                # and block_size are multiples of every query length, so the
-                # contiguous [offset, offset+q_len) write never wraps / straddles.
-                if self.is_blocked:
-                    key, value = cache.update_and_fetch(
-                        self.slot, block_idx, write_offset, key, value, query_len
-                    )
-                else:
-                    key, value = cache.update_and_fetch(
-                        self.slot, write_offset, key, value, query_len
-                    )
+                # Flat cache write at a single dynamic offset (runner-computed:
+                # in_step % S for sliding, in_step for global). S and ctx are
+                # multiples of every q_len, so the contiguous [offset, offset+q_len)
+                # write never wraps / straddles — a plain mutable_slice_update.
+                key, value = cache.update_and_fetch(
+                    self.slot, write_offset, key, value, query_len
+                )
 
             # Q back to BC1S for SDPA
             query = query.reshape(batch_size, query_len, 1, n_heads * head_dim).transpose(-3, -1)
@@ -328,10 +317,9 @@ class TransformerBlock(nn.Module):
         rope_cos: torch.Tensor,
         rope_sin: torch.Tensor,
         write_offset: torch.IntTensor,
-        block_idx: torch.IntTensor | None,
         causal_mask: torch.Tensor,
         per_layer_input: torch.Tensor | None = None,
-        cache: KVCacheHandler | BlockedKVCacheHandler | None = None,
+        cache: KVCacheHandler | None = None,
     ) -> torch.Tensor:
         # Self-attention (pre+post norm)
         r = self.self_attn(
@@ -339,7 +327,6 @@ class TransformerBlock(nn.Module):
             rope_cos,
             rope_sin,
             write_offset,
-            block_idx,
             causal_mask,
             cache,
         )
@@ -458,19 +445,13 @@ class Gemma4Model(nn.Module):
         self.layers = nn.ModuleList(layers)
         self.norm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
 
-        # Single combined RoPE cache (sliding + global tables concatenated),
-        # gathered once per forward. Sliding layers use [:head_dim], global
-        # layers [head_dim:].
-        sliding_params = config.rope_parameters["sliding_attention"]
-        global_params = config.rope_parameters["full_attention"]
-        self.rope = Gemma4CombinedRoPE(
-            sliding_head_dim=config.head_dim,
-            global_head_dim=config.global_head_dim,
-            max_cache_size=config.max_position_embeddings,
-            sliding_base=sliding_params["rope_theta"],
-            global_base=global_params["rope_theta"],
-            partial_rotary_factor=global_params.get("partial_rotary_factor", 0.25),
-        )
+        # RoPE cos/sin are precomputed in the runner and passed in as graph inputs
+        # (``rope_cos`` / ``rope_sin``, the combined sliding+global table rows for the
+        # chunk's positions) — see ``forward``. The position index for a 131k context
+        # exceeds a 16-bit input and a 32-bit position input crashes the MPSGraph
+        # streaming compiler, so the in-graph gather (and its ~400 MB cos/sin constant
+        # tables) is removed. ``Gemma4CombinedRoPE`` is kept as the numerical reference
+        # the runner / parity reimplements (its ``_compute_sin_and_cos``).
 
     def _compute_per_layer_inputs(
         self,
@@ -501,13 +482,13 @@ class Gemma4Model(nn.Module):
     def forward(
         self,
         token_embeddings: torch.Tensor,
-        position_ids: torch.IntTensor,
+        rope_cos: torch.Tensor,
+        rope_sin: torch.Tensor,
         in_step: torch.IntTensor,
         sliding_in_step: torch.IntTensor,
-        global_block_idx: torch.IntTensor,
         causal_mask: torch.Tensor,
         sliding_causal_mask: torch.Tensor,
-        global_cache: BlockedKVCacheHandler | None = None,
+        global_cache: KVCacheHandler | None = None,
         sliding_cache: KVCacheHandler | None = None,
         ple_embeddings: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -515,20 +496,19 @@ class Gemma4Model(nn.Module):
 
         layer_types = self.config.layer_types
 
-        # Gather RoPE cos/sin ONCE (single composite), then slice the sliding
-        # and global sub-ranges out of the combined table.
+        # RoPE cos/sin arrive precomputed from the runner as the combined
+        # sliding+global table rows ``(1, q_len, sliding_hd + global_hd)``. Slice the
+        # sliding sub-range ``[:head_dim]`` and the global sub-range ``[head_dim:]``
+        # (no in-graph gather; positions can exceed the 16-bit input limit).
         head_dim = self.config.head_dim
-        combined_cos, combined_sin = self.rope.gather_cos_sin(position_ids)
-        sliding_cos = combined_cos[..., :head_dim]
-        sliding_sin = combined_sin[..., :head_dim]
-        global_cos = combined_cos[..., head_dim:]
-        global_sin = combined_sin[..., head_dim:]
+        sliding_cos = rope_cos[..., :head_dim]
+        sliding_sin = rope_sin[..., :head_dim]
+        global_cos = rope_cos[..., head_dim:]
+        global_sin = rope_sin[..., head_dim:]
 
-        # Global write coordinates come pre-split from the runner (like
-        # sliding_in_step): ``global_block_idx`` = in_step // block_size and
-        # ``in_step`` itself carries the in-block offset (in_step % block_size). The
-        # graph does no index arithmetic on the slice coordinates, which keeps it on
-        # the Neural Engine.
+        # Global cache is FLAT: a single dynamic write offset = the absolute position
+        # ``in_step`` (no block index). ``BlockedSDPA`` walks the flat slot in
+        # block_size chunks internally, so the graph carries no second dynamic offset.
         global_offset = in_step
 
         per_layer_inputs = None
@@ -543,14 +523,14 @@ class Gemma4Model(nn.Module):
             if layer_types[i] == "sliding_attention":
                 rope_cos, rope_sin = sliding_cos, sliding_sin
                 cache, attn_mask = sliding_cache, sliding_causal_mask
-                write_offset, block_idx = sliding_in_step, None
+                write_offset = sliding_in_step
             else:
                 rope_cos, rope_sin = global_cos, global_sin
                 cache, attn_mask = global_cache, causal_mask
-                write_offset, block_idx = global_offset, global_block_idx
+                write_offset = global_offset
 
             h = layer(
-                h, rope_cos, rope_sin, write_offset, block_idx, attn_mask,
+                h, rope_cos, rope_sin, write_offset, attn_mask,
                 per_layer_input=per_layer_input,
                 cache=cache,
             )
@@ -577,23 +557,26 @@ class Gemma4Extend(nn.Module):
         else:
             self.lm_head = None
 
-        # Two compacted KV caches, each holding only its type's storing layers:
-        #  - global: full-context, blocked (block-outermost, block_size seq axis)
-        #    so each tensor stays Neural-Engine-resident; n_kv * global_head_dim channels
-        #  - sliding: small ring (static seq dim S), n_kv * head_dim channels
+        # Two compacted KV caches, both FLAT (single dynamic write offset, so each ANE
+        # region has ≤1 dynamic-offset LiveInParam):
+        #  - global: full-context flat cache `[n_global_storing, 1, C_g, 1, ctx]`; the
+        #    chunked flash `BlockedSDPA` walks the flat slot in block_size chunks, so the
+        #    score key-axis stays ANE-safe up to ctx ~32768. (Beyond that the flat slot
+        #    read + mask exceed the ANE ~65536 per-dim cap — a compiler limit.)
+        #  - sliding: small ring (static seq dim S), n_kv * head_dim channels.
         n_kv_heads = config.num_key_value_heads
         global_channels = n_kv_heads * config.global_head_dim
         sliding_channels = n_kv_heads * config.head_dim
-        self.global_cache = BlockedKVCacheHandler(self.model.n_global_storing, global_channels)
+        self.global_cache = KVCacheHandler(self.model.n_global_storing, global_channels)
         self.sliding_cache = KVCacheHandler(self.model.n_sliding_storing, sliding_channels)
 
     def forward(
         self,
         transformer_input: torch.Tensor,
-        position_ids: torch.IntTensor,
+        rope_cos: torch.Tensor,
+        rope_sin: torch.Tensor,
         in_step: torch.IntTensor,
         sliding_in_step: torch.IntTensor,
-        global_block_idx: torch.IntTensor,
         causal_mask: torch.Tensor,
         sliding_causal_mask: torch.Tensor,
         key_cache: torch.Tensor,
@@ -621,10 +604,10 @@ class Gemma4Extend(nn.Module):
 
         out = self.model(
             transformer_input,
-            position_ids,
+            rope_cos,
+            rope_sin,
             in_step,
             sliding_in_step,
-            global_block_idx,
             causal_mask,
             sliding_causal_mask,
             global_cache=self.global_cache,
@@ -633,7 +616,14 @@ class Gemma4Extend(nn.Module):
         )
 
         if self.prefill_mode:
-            return self.global_cache.k_cache[0, 0, 0, 0, 0] + self.global_cache.v_cache[0, 0, 0, 0, 0]
+            # Prefill output is unused (the runner only wants the cache writes); return
+            # a width-1 slice that still depends on both global cache writes so they are
+            # not dead-code-eliminated. (A full-width slice would be a block_size-wide
+            # tensor — needless, and ctx-wide for a flat cache, which trips ANEC.)
+            return (
+                self.global_cache.k_cache[0, 0, 0, 0, :1]
+                + self.global_cache.v_cache[0, 0, 0, 0, :1]
+            )
 
         if self.lm_head is not None:
             return self.lm_head(out.transpose(-2, -3))
@@ -672,10 +662,10 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
     def forward(
         self,
         input_ids: torch.Tensor,
-        position_ids: torch.IntTensor,
+        rope_cos: torch.Tensor,
+        rope_sin: torch.Tensor,
         in_step: torch.IntTensor,
         sliding_in_step: torch.IntTensor,
-        global_block_idx: torch.IntTensor,
         causal_mask: torch.Tensor,
         sliding_causal_mask: torch.Tensor,
         key_cache: torch.Tensor,
@@ -687,10 +677,10 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
         token_embeddings = self.gather_embeddings(input_ids, self.load_embeddings.embedding_table)
         return self.extend(
             token_embeddings,
-            position_ids,
+            rope_cos,
+            rope_sin,
             in_step,
             sliding_in_step,
-            global_block_idx,
             causal_mask,
             sliding_causal_mask,
             key_cache,

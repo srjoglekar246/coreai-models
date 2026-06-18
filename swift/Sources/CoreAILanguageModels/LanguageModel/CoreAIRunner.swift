@@ -105,7 +105,8 @@ public struct CoreAIRunner {
             ),
             serializedModel: [modelAsset],
             function: functionName,
-            slidingWindow: bundle.slidingWindow
+            slidingWindow: bundle.slidingWindow,
+            rope: bundle.rope
         )
     }
 }

@@ -23,10 +23,6 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     private static let slidingCausalMaskName = "sliding_causal_mask"
     private static let slidingInStepName = "sliding_in_step"
     private static let causalMaskName = "causal_mask"
-    // Blocked global cache (Gemma4 large-context): the runner-provided destination
-    // block index for the global cache write (= in_step / block_size). The in-block
-    // offset is supplied separately (via in_step), so the graph does no index math.
-    private static let globalBlockIdxName = "global_block_idx"
 
     public var vocabSize: Int { config.vocabSize }
 
@@ -66,6 +62,12 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     private let hasSlidingCache: Bool
     // Sliding-cache ring depth S (last dim of the sliding cache); 0 when absent.
     private let slidingRingDepth: Int
+
+    // Combined per-dim RoPE theta (sliding ‖ global), precomputed once at init from
+    // the model's dual-RoPE config. Gemma4 large-context graphs take precomputed
+    // `rope_cos`/`rope_sin` rows (the runner builds them per step from this) instead
+    // of `position_ids`. Empty for models that gather RoPE in-graph.
+    private let ropeTheta: [Double]
 
     // Number of tokens already processed in the current sequence.
     private var processedTokenCount: Int = 0
@@ -145,7 +147,13 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
                 return nil
             }
             CLILogger.log("Cache '\(name)' allocated: \(d.minimumByteCount) bytes (IOSurface)")
-            return NDArray(descriptor: d)
+            var arr = NDArray(descriptor: d)
+            // Zero the full backing buffer. The chunked-flash global attention reads
+            // ALL key positions every step (including the unwritten tail) with an
+            // ADDITIVE mask; any garbage in unwritten positions feeds `q @ k` and can
+            // overflow fp16 to Inf, which `+ (-40000)` cannot suppress → NaN logits.
+            Self.zeroCache(&arr)
+            return arr
         }
         guard let key = allocateState(Self.keyCacheName),
             let value = allocateState(Self.valueCacheName)
@@ -167,6 +175,17 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             self.slidingRingDepth = sd.shape.last ?? 0
         } else {
             self.slidingRingDepth = 0
+        }
+
+        // Precompute the combined RoPE theta vector once (position-independent), so
+        // each step only does `width` sincos per token.
+        if let rope = configuration.rope {
+            self.ropeTheta = Self.buildRopeTheta(rope)
+            CLILogger.log(
+                "RoPE precompute: width=\(self.ropeTheta.count) "
+                    + "(sliding \(rope.slidingHeadDim) + global \(rope.globalHeadDim))")
+        } else {
+            self.ropeTheta = []
         }
 
         CLILogger.log("Engine initialized")
@@ -194,6 +213,16 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     }
 
     // MARK: - Initialization Helpers
+
+    /// Zeroes an NDArray's backing buffer, so a freshly-allocated KV cache reads as
+    /// 0 in every unwritten position. Mirrors `CoreAISequentialEngine.zeroFill`.
+    private static func zeroCache(_ array: inout NDArray) {
+        let count = array.shape.reduce(1, *)
+        var view = array.mutableView(as: LogitsScalarType.self)
+        view.withUnsafeMutablePointer { ptr, _, _ in
+            for i in 0..<count { ptr[i] = 0 }
+        }
+    }
 
     private static func requireDescriptor(
         model: AIModel, functionName: String
@@ -315,20 +344,6 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     private static func contextLength(
         descriptor: InferenceFunctionDescriptor, config: ModelConfig
     ) -> Int {
-        // Blocked global cache (Gemma4 large-context): the global cache is 5D
-        // [n_blocks, n_slots, C, 1, block_size] and the blocked causal_mask is 5D
-        // (1, n_blocks, block_size, 1, q_len). The total context is n_blocks *
-        // block_size, not the last (block_size) dim. The rank-5 causal_mask is the
-        // unambiguous signal that this is the blocked layout.
-        if case .ndArray(let maskDesc) = descriptor.inputDescriptor(of: causalMaskName),
-            maskDesc.shape.count == 5,
-            case .ndArray(let keyDesc) = descriptor.stateDescriptor(of: keyCacheName),
-            !keyDesc.shape.contains(-1)
-        {
-            let nBlocks = keyDesc.shape.first ?? 1
-            let blockSize = keyDesc.shape.last ?? config.maxContextLength
-            return nBlocks * blockSize
-        }
         if case .ndArray(let keyDesc) = descriptor.stateDescriptor(of: keyCacheName) {
             // A dynamic (-1) last dim can't be a concrete context length; fall
             // back to the configured max so function selection still matches.
@@ -441,43 +456,74 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         }
     }
 
-    /// Builds the blocked global causal mask `(1, n_blocks, block_size, 1, q_len)`
-    /// for the blocked global cache. Key `(block t, j)` holds
-    /// absolute position `t*block_size + j`; for a query at `p = alignedStep + query`
-    /// it is unmasked (full causal) iff `t*block_size + j <= p`. Everything else is
-    /// -40000 (fp16-safe -inf), including padding in not-yet-written blocks.
-    private static func fillBlockedCausalMask(
-        _ view: inout NDArray.MutableView<LogitsScalarType>,
-        tokensInBatch: Int,
+    // MARK: - RoPE (precomputed cos/sin)
+
+    /// Builds the combined per-dim RoPE theta vector (sliding ‖ global), the exact
+    /// torch reference `Gemma4CombinedRoPE._compute_sin_and_cos`. Width =
+    /// `sliding_head_dim + global_head_dim`. For position `p`, `rope_cos[d] =
+    /// cos(p · theta[d])` and `rope_sin[d] = sin(p · theta[d])`.
+    ///
+    /// - Sliding sub-range `[0, sliding_hd)`: standard (full-rotary) RoPE — the
+    ///   `sliding_hd/2` inverse frequencies repeated twice (GPT-NeoX layout).
+    /// - Global sub-range `[sliding_hd, sliding_hd + global_hd)`: partial rotary —
+    ///   only the first `rope_angles = floor(partial_rotary_factor · global_hd / 2)`
+    ///   of the `global_hd/2` frequencies rotate; the rest are 0 (NoPE), repeated twice.
+    static func buildRopeTheta(_ rope: RoPEConfig) -> [Double] {
+        let slidingHd = rope.slidingHeadDim
+        let globalHd = rope.globalHeadDim
+        var theta = [Double](repeating: 0, count: slidingHd + globalHd)
+
+        let sHalf = slidingHd / 2
+        for j in 0..<slidingHd {
+            let k = j % sHalf
+            theta[j] = pow(rope.slidingRopeTheta, -(Double(2 * k) / Double(slidingHd)))
+        }
+
+        let gHalf = globalHd / 2
+        let ropeAngles = Int((rope.partialRotaryFactor * Double(globalHd)) / 2.0)
+        for j in 0..<globalHd {
+            let m = j % gHalf
+            theta[slidingHd + j] =
+                m < ropeAngles ? pow(rope.globalRopeTheta, -(Double(2 * m) / Double(globalHd))) : 0
+        }
+        return theta
+    }
+
+    /// Fills the `rope_cos` / `rope_sin` graph inputs for this batch's positions.
+    /// Token `i` is at absolute position `alignedStep + i`; for each of the `width`
+    /// dims we write `cos`/`sin` of `pos · theta[d]` as float16. `q_len ≤ 64` and
+    /// `width = 768`, so this is a few × 10⁴ sincos per step — negligible vs the
+    /// graph forward (confirmed by the `RopeBuild` profile span).
+    private func fillRope(
+        into inputs: inout [String: NDArray],
+        desc: InferenceFunctionDescriptor,
+        batchSize: Int,
         alignedStep: Int
-    ) {
-        view.withUnsafeMutablePointer { ptr, shape, strides in
-            // shape: (1, n_blocks, block_size, 1, q_len)
-            let nBlocks = shape[1]
-            let blockSize = shape[2]
-            let qLen = shape[4]
-            for b in 0..<nBlocks {
-                for j in 0..<blockSize {
-                    let base = b &* strides[1] &+ j &* strides[2]
-                    for query in 0..<qLen {
-                        ptr[base &+ query &* strides[4]] = LogitsScalarType(-40000.0)
+    ) throws {
+        guard !ropeTheta.isEmpty else {
+            throw InferenceRuntimeError.invalidState(
+                "Graph wants 'rope_cos'/'rope_sin' but the model config has no rope parameters")
+        }
+        for (name, isCos) in [("rope_cos", true), ("rope_sin", false)] {
+            guard case .ndArray(let nd) = desc.inputDescriptor(of: name) else {
+                throw InferenceRuntimeError.invalidState("Graph '\(name)' has no ndArray descriptor")
+            }
+            var arr = NDArray(descriptor: nd)
+            var view = arr.mutableView(as: LogitsScalarType.self)
+            view.withUnsafeMutablePointer { ptr, shape, strides in
+                // shape: (1, q_len, width)
+                let width = shape[2]
+                for i in 0..<batchSize {
+                    let pos = Double(alignedStep + i)
+                    let rowBase = i &* strides[1]
+                    for d in 0..<width {
+                        let angle = pos * ropeTheta[d]
+                        let value = isCos ? cos(angle) : sin(angle)
+                        ptr[rowBase &+ d &* strides[2]] = LogitsScalarType(value)
                     }
                 }
             }
-            // Unmask the causal prefix [0, queryPos] at each key's (block, offset).
-            let maxKey = nBlocks &* blockSize &- 1
-            for query in 0..<tokensInBatch {
-                let queryPos = alignedStep &+ query
-                let upper = min(queryPos, maxKey)
-                var key = 0
-                while key <= upper {
-                    let b = key / blockSize
-                    let j = key % blockSize
-                    let offset = b &* strides[1] &+ j &* strides[2] &+ query &* strides[4]
-                    ptr[offset] = 0
-                    key &+= 1
-                }
-            }
+            inputs[name] = arr
         }
     }
 
@@ -629,6 +675,28 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             let logitsArray = outputs.remove(Self.logitsOutputName)?.ndArray
             logitsSpan.end()
 
+            // TEMPORARY diagnostic (COREAI_LOGITS_DEBUG): scan EVERY step's output
+            // (prefill included) for NaN/Inf, to pinpoint the step/graph where the
+            // multi-block path first blows up.
+            if ProcessInfo.processInfo.environment["COREAI_LOGITS_DEBUG"] != nil,
+                let logitsArray
+            {
+                let dbgView = logitsArray.view(as: LogitsScalarType.self)
+                if let els = dbgView.contiguousElements {
+                    var bad = 0
+                    var idx = 0
+                    let n = els.count
+                    while idx < n {
+                        let x = Float(els[idx])
+                        if x.isNaN || x.isInfinite { bad += 1 }
+                        idx += 1
+                    }
+                    CLILogger.log(
+                        "LOGITS_DEBUG graph=\(graphName) step=\(batchStartToken) "
+                            + "prefill=\(usePrefill) nan/inf=\(bad)/\(n)")
+                }
+            }
+
             // Extract logits from the last token position.
             if !usePrefill, let logitsArray {
                 let copySpan = InstrumentsProfiler.beginLogitsCopy()
@@ -668,16 +736,6 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         let desc = try functionDescriptor(for: graphName)
         var inputs = [String: NDArray]()
 
-        // Block size for the blocked global cache (0 if not a blocked Gemma4 graph).
-        // Read from the rank-5 blocked causal_mask descriptor
-        // (1, n_blocks, block_size, 1, q_len). Used to pre-split the global write
-        // coords (block index + in-block offset) in the runner so the graph does no
-        // index arithmetic, which keeps it on the Neural Engine.
-        var globalBlockSize = 0
-        if case .ndArray(let m) = desc.inputDescriptor(of: Self.causalMaskName), m.shape.count == 5 {
-            globalBlockSize = m.shape[2]
-        }
-
         if desc.inputNames.contains("embedding_table") {
             inputs["embedding_table"] = embeddingTable
         }
@@ -697,34 +755,38 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             }
             inputs[txName] = gathered
         }
-        // Position IDs
-        guard let posName = desc.inputNames.first(where: { $0.contains("pos") }) else {
-            throw InferenceRuntimeError.invalidState("Graph '\(graphName)' has no position_ids input")
-        }
-        if case .ndArray(let nd) = desc.inputDescriptor(of: posName) {
-            var pos = NDArray(descriptor: nd)
-            var posView = pos.mutableView(as: UInt16.self)
-            guard var posSpan = posView.contiguousElements else {
-                throw InferenceRuntimeError.invalidState("pos array has non-contiguous layout")
+        // RoPE inputs. Gemma4 large-context graphs take precomputed `rope_cos` /
+        // `rope_sin` (the runner builds the combined sliding+global table rows per
+        // step); all other models take `position_ids` and gather RoPE in-graph.
+        if desc.inputNames.contains("rope_cos") {
+            let ropeSpan = InstrumentsProfiler.beginRopeBuild()
+            try fillRope(
+                into: &inputs, desc: desc, batchSize: batchSize, alignedStep: alignedStep)
+            ropeSpan.end()
+        } else if let posName = desc.inputNames.first(where: { $0.contains("pos") }) {
+            if case .ndArray(let nd) = desc.inputDescriptor(of: posName) {
+                var pos = NDArray(descriptor: nd)
+                var posView = pos.mutableView(as: UInt16.self)
+                guard var posSpan = posView.contiguousElements else {
+                    throw InferenceRuntimeError.invalidState("pos array has non-contiguous layout")
+                }
+                for i in 0..<batchSize {
+                    posSpan[i] = UInt16(alignedStep + i)
+                }
+                inputs[posName] = pos
             }
-            for i in 0..<batchSize {
-                posSpan[i] = UInt16(alignedStep + i)
-            }
-            inputs[posName] = pos
+        } else {
+            throw InferenceRuntimeError.invalidState(
+                "Graph '\(graphName)' has no 'rope_cos'/'rope_sin' or 'position_ids' input")
         }
 
-        // Causal mask
+        // Causal mask (flat (1, ctx, 1, q_len) — same for the flat single-block SDPA
+        // and the chunked-flash BlockedSDPA, which walks it in block_size chunks).
         let maskSpan = InstrumentsProfiler.beginMaskBuild()
         if case .ndArray(let nd) = desc.inputDescriptor(of: Self.causalMaskName) {
             var mask = NDArray(descriptor: nd)
             var maskView = mask.mutableView(as: LogitsScalarType.self)
-            if nd.shape.count == 5 {
-                // Blocked global mask (1, n_blocks, block_size, 1, q_len).
-                Self.fillBlockedCausalMask(
-                    &maskView, tokensInBatch: tokensInBatch, alignedStep: alignedStep)
-            } else {
-                Self.fillCausalMask(&maskView, tokensInBatch: tokensInBatch, alignedStep: alignedStep)
-            }
+            Self.fillCausalMask(&maskView, tokensInBatch: tokensInBatch, alignedStep: alignedStep)
             inputs[Self.causalMaskName] = mask
         }
 
@@ -744,10 +806,11 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         }
         maskSpan.end()
 
-        // Step(s). Models have `in_step` (absolute write offset). Gemma4 also has
-        // `sliding_in_step` = alignedStep % S, the sliding ring write offset
-        // (computed here so the graph needs no remainder op, which the ANE
-        // compiler can't lower). Both inputs match `*step*`, so set each by name.
+        // Step(s). Models have `in_step` (the absolute flat write offset into the
+        // global cache). Gemma4 also has `sliding_in_step` = alignedStep % S, the
+        // sliding ring write offset (computed here so the graph needs no remainder op,
+        // which the ANE compiler can't lower). Both inputs match `*step*`, so set each
+        // by name.
         for stepName in desc.inputNames where stepName.contains("step") && !stepName.contains("pos") {
             guard case .ndArray(let nd) = desc.inputDescriptor(of: stepName) else { continue }
             var step = NDArray(descriptor: nd)
@@ -757,35 +820,10 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             }
             if stepName == Self.slidingInStepName {
                 stepSpan[0] = Int32(slidingRingDepth > 0 ? alignedStep % slidingRingDepth : alignedStep)
-            } else if globalBlockSize > 0 {
-                // Blocked global cache: in_step carries the in-block write offset
-                // (alignedStep % block_size); the destination block is sent
-                // separately as global_block_idx. Pre-split here so the graph needs
-                // no division/modulo and stays on the Neural Engine.
-                stepSpan[0] = Int32(alignedStep % globalBlockSize)
             } else {
                 stepSpan[0] = Int32(alignedStep)
             }
             inputs[stepName] = step
-        }
-
-        // Global block index (Gemma4 blocked global cache): the destination block
-        // for this batch's write = alignedStep / block_size.
-        if desc.inputNames.contains(Self.globalBlockIdxName),
-            case .ndArray(let nd) = desc.inputDescriptor(of: Self.globalBlockIdxName)
-        {
-            guard globalBlockSize > 0 else {
-                throw InferenceRuntimeError.invalidState(
-                    "Graph '\(graphName)' has '\(Self.globalBlockIdxName)' but no rank-5 "
-                        + "blocked causal_mask to derive block_size from")
-            }
-            var blockIdx = NDArray(descriptor: nd)
-            var blockIdxView = blockIdx.mutableView(as: Int32.self)
-            guard var blockIdxSpan = blockIdxView.contiguousElements else {
-                throw InferenceRuntimeError.invalidState("global_block_idx array has non-contiguous layout")
-            }
-            blockIdxSpan[0] = Int32(alignedStep / globalBlockSize)
-            inputs[Self.globalBlockIdxName] = blockIdx
         }
 
         // Per-Layer Embeddings (Gemma4): gather INT8 rows for this batch's tokens.
@@ -844,6 +882,11 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         guard var tokenSpan = tokenView.contiguousElements else {
             throw InferenceRuntimeError.invalidState("tokenArray has non-contiguous layout")
         }
+        // Zero unused (padding) query slots first: a partial final batch leaves
+        // slots [tokensInBatch..<batchSize] otherwise uninitialized, so they'd gather
+        // a garbage token id → garbage query embedding. Padding with token 0 keeps the
+        // discarded columns finite (garbage could feed NaN into shared reductions).
+        for i in 0..<tokenSpan.count { tokenSpan[i] = 0 }
         if tokenNDDesc.shape.count == 2 {
             for i in 0..<min(batchSize, tokenIDs.count) {
                 tokenSpan[i] = tokenIDs[i]

@@ -69,6 +69,11 @@ public struct ModelConfig: InferenceConfiguration, Codable, Sendable {
     /// the static-shape engine to build the windowed `sliding_causal_mask`.
     public var slidingWindow: Int?
 
+    /// Dual-RoPE parameters (Gemma4 large-context). When present, the static-shape
+    /// engine precomputes `rope_cos`/`rope_sin` per step instead of filling
+    /// `position_ids`. nil for models that gather RoPE in-graph.
+    public var rope: RoPEConfig?
+
     public enum InputMode: String, Codable, Sendable {
         case random
         case allZeros = "all-zeros"
@@ -83,7 +88,8 @@ public struct ModelConfig: InferenceConfiguration, Codable, Sendable {
         serializedModel: [String],
         function: String,
         inputMode: InputMode? = nil,
-        slidingWindow: Int? = nil
+        slidingWindow: Int? = nil,
+        rope: RoPEConfig? = nil
     ) {
         self.name = name
         self.tokenizer = tokenizer
@@ -94,6 +100,7 @@ public struct ModelConfig: InferenceConfiguration, Codable, Sendable {
         self.function = function
         self.inputMode = inputMode
         self.slidingWindow = slidingWindow
+        self.rope = rope
     }
 
     enum CodingKeys: String, CodingKey {
@@ -106,6 +113,7 @@ public struct ModelConfig: InferenceConfiguration, Codable, Sendable {
         case function
         case inputMode = "input_mode"
         case slidingWindow = "sliding_window"
+        case rope
     }
 
     public init(from decoder: Decoder) throws {
@@ -119,6 +127,7 @@ public struct ModelConfig: InferenceConfiguration, Codable, Sendable {
         self.function = try c.decodeIfPresent(String.self, forKey: .function) ?? "main"
         self.inputMode = try c.decodeIfPresent(InputMode.self, forKey: .inputMode)
         self.slidingWindow = try c.decodeIfPresent(Int.self, forKey: .slidingWindow)
+        self.rope = try c.decodeIfPresent(RoPEConfig.self, forKey: .rope)
     }
 }
 

@@ -36,7 +36,7 @@ from coreai_models.export.compression import (
     quantize_pytorch_model,
 )
 from coreai_models.export.ios import (
-    DEFAULT_KV_BLOCK_SIZE,
+    MIN_CONTEXT_LENGTH,
     QUERY_LENGTHS,
     export_ios_model,
     sliding_ring_size,
@@ -293,17 +293,22 @@ async def _async_export_model(config: ExportConfig) -> str:
             has_sliding = hasattr(model, "extend") and hasattr(model.extend, "sliding_cache")
             if has_sliding:
                 # Two compacted caches + the runner-built sliding mask (Gemma4). The
-                # global cache is blocked (5D, block-outermost) so it stays resident
-                # on the Neural Engine at large context; the global mask is blocked
-                # too and the runner supplies the destination block index.
+                # global cache is FLAT (single dynamic write offset); the chunked flash
+                # SDPA walks the flat slot in block_size chunks and the global mask is
+                # flat (1, ctx, 1, q_len) (ANE-resident up to ctx ~32768).
                 n_kv = hf_config.num_key_value_heads
                 n_global_storing = model.extend.model.n_global_storing
                 n_sliding_storing = model.extend.model.n_sliding_storing
                 sliding_ring = sliding_ring_size(hf_config.sliding_window, max(QUERY_LENGTHS))
-                block_size = getattr(model.extend.model, "kv_block_size", DEFAULT_KV_BLOCK_SIZE)
-                n_blocks = (effective_max_ctx + block_size - 1) // block_size
+                # Palettization quantizes shared weights; calibration only needs
+                # representative activations, so use the smallest context bucket (a
+                # single ctx-wide flash chunk) — far cheaper than the full ctx and
+                # numerically equivalent for weight statistics.
+                ctx = min(MIN_CONTEXT_LENGTH, effective_max_ctx)
+                # FLAT global cache [n_global_storing, 1, C_g, 1, ctx] — single dynamic
+                # write offset; the chunked flash SDPA walks it in block_size chunks.
                 key_cache = torch.zeros(
-                    n_blocks, n_global_storing, n_kv * global_head_dim, 1, block_size,
+                    n_global_storing, 1, n_kv * global_head_dim, 1, ctx,
                     dtype=torch.float16,
                 )
                 value_cache = key_cache.clone()
@@ -313,15 +318,19 @@ async def _async_export_model(config: ExportConfig) -> str:
                 sliding_value_cache = sliding_key_cache.clone()
                 sliding_causal_mask = torch.zeros(1, sliding_ring, 1, query_len, dtype=torch.float16)
                 sliding_in_step = torch.zeros((1,), dtype=torch.int32)
-                global_block_idx = torch.zeros((1,), dtype=torch.int32)
-                # Blocked global mask: one (block_size, q_len) tile per block.
-                causal_mask = torch.zeros(1, n_blocks, block_size, 1, query_len, dtype=torch.float16)
+                # Flat global mask (1, ctx, 1, q_len).
+                causal_mask = torch.zeros(1, ctx, 1, query_len, dtype=torch.float16)
+                # RoPE cos/sin are precomputed in the runner (combined sliding+global
+                # table rows) and passed as float16 inputs instead of position_ids.
+                rope_width = head_dim + global_head_dim
+                rope_cos = torch.zeros(1, query_len, rope_width, dtype=torch.float16)
+                rope_sin = torch.zeros(1, query_len, rope_width, dtype=torch.float16)
                 palettization_inputs = (
                     input_ids,
-                    position_ids,
+                    rope_cos,
+                    rope_sin,
                     in_step,
                     sliding_in_step,
-                    global_block_idx,
                     causal_mask,
                     sliding_causal_mask,
                     key_cache,
