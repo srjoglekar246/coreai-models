@@ -7,9 +7,7 @@ tokens) for on-device agentic tasks.
 
 ## Supported Models
 
-| Model                | Parameters         | macOS | iOS |
-| -------------------- | ------------------ | ----- | --- |
-| Gemma 4 E2B Instruct | E2B (effective 2B) | No    | Yes |
+Gemma 4 E2B Instruct (iOS-style)
 
 ## Gated Access
 
@@ -39,8 +37,8 @@ Gemma 4 is exported for iOS (Neural Engine) with a fixed context length:
 # Default context length
 uv run coreai.llm.export google/gemma-4-E2B-it --platform iOS
 
-# Large context (up to 131,072 tokens)
-uv run coreai.llm.export google/gemma-4-E2B-it --platform iOS --max-context-length 131072
+# Large context (up to 32768 tokens)
+uv run coreai.llm.export google/gemma-4-E2B-it --platform iOS --max-context-length 32768
 ```
 
 The iOS preset uses 4-bit palettization (channel group size 32) and an 8-bit Embedding
@@ -67,22 +65,32 @@ uv run coreai.llm.export google/gemma-4-E2B-it --platform iOS --dry-run
 
 Gemma 4 interleaves two attention types per layer — **sliding-window** layers that
 attend only the last 512 tokens, and **global** layers that attend the full history.
-The Core AI recipe implements both correctly on-device and compacts the KV cache so
-that long contexts are feasible on the Neural Engine:
+The Core AI recipe implements both correctly on-device and keeps long contexts
+feasible on the Neural Engine:
 
-- **Two right-sized KV caches.** A full-context **global** cache and a small,
+- **Two compact KV caches.** A full-context **global** cache and a small,
   fixed-depth **sliding-window** ring cache, each holding only the layers and
   channels it needs (later layers reuse earlier same-type KV). The sliding ring is a
-  constant size regardless of context length, so only the global cache grows. At
-  131,072 tokens the combined cache is ~812 MB instead of ~14 GB for a naive
-  full-size cache.
+  constant size regardless of context length, so only the global cache grows with the
+  prompt.
 
-- **Blocked global attention.** The global cache is stored block-wise and global
-  attention is computed block-by-block with a flash / online-softmax recurrence
-  (mathematically identical to standard attention). This keeps every attention
-  tensor within the sizes the Neural Engine supports, so the model stays fully
-  Neural-Engine-resident even at 131,072 tokens — including correct recall of facts
-  buried deep in a long prompt (needle-in-a-haystack).
+- **Chunked (flash) global attention.** Global attention is computed in fixed-width
+  chunks over the cache with an online-softmax recurrence (mathematically identical to
+  standard attention, parity ~1e-6). This keeps every attention tensor within the
+  sizes the Neural Engine supports, so the global layers stay Neural-Engine-resident
+  for context lengths up to 32,768 tokens — including correct recall of facts buried
+  deep in a long prompt (needle-in-a-haystack). The model still exports and runs at
+  larger context lengths (up to 131,072), with the global layers running partly off
+  the Neural Engine beyond 32,768.
+
+- **Per-context program ladder + right-sized cache.** The model is exported as a
+  ladder of statically-shaped programs at power-of-two context lengths (256, 512, …,
+  up to the configured maximum). At run time the engine picks the smallest program
+  that covers the current position and allocates the global cache to *that* size,
+  growing it (and carrying the written history forward) only as the context crosses
+  into a larger bucket. A short prompt therefore runs a small graph and a small cache
+  instead of always paying for the maximum context — short prompts decode several
+  times faster and use a fraction of the memory of a full-context session.
 
 Positions and RoPE are applied before caching, so cache layout does not affect
 correctness. Decode throughput is highest at short contexts and decreases as the
@@ -111,23 +119,28 @@ print(response)
 swift run -c release llm-runner --model path/to/exported_model_folder --prompt "Hello"
 ```
 
-## Benchmark a Core AI Language Model
-
-```bash
-swift run -c release llm-benchmark --model path/to/exported_model_folder
-```
-
-Defaults: 512 prompt tokens, 1024 generation tokens, 5 trials. Override with `-p`, `-g`, and `-n`.
-
 ## Performance
 
-Measured on Apple silicon with the iOS (Neural Engine) export running via
-`llm-runner`, 4-bit palettized weights. Decode runs fully on the Neural Engine;
-throughput is highest at short contexts and scales down as the global layers attend
-a longer history. Large-context exports incur a larger one-time compile on first
-load (cached thereafter).
+Measured on an **Apple M4 Max MacBook Pro** with the iOS (Neural Engine) export
+running via `llm-runner`, 4-bit palettized weights, fully Neural-Engine-resident.
+One real-text prompt per program-ladder bucket (sized so decode sits in that bucket);
+a warm run is discarded first, then the measured run is reported. *Prompt tok/s* is
+prefill over the whole prompt; *Decode tok/s* is per-step generation throughput. The
+first use of each context size pays a one-time compile (cached thereafter).
 
-| Context        | Decode throughput (Neural Engine)                        |
-| -------------- | -------------------------------------------------------- |
-| Small (≤ 4k)   | ~20 tokens/s                                             |
-| Large (~128k)  | lower — the full history is attended each decode step    |
+| Prompt tokens | Decode context | Prompt tok/s | Decode tok/s |
+| ------------: | -------------: | -----------: | -----------: |
+|            95 |            256 |        1,545 |         24.1 |
+|           294 |            512 |        3,152 |         24.1 |
+|           767 |          1,024 |        5,077 |         23.6 |
+|         1,623 |          2,048 |          760 |         12.8 |
+|         3,349 |          4,096 |          569 |         12.5 |
+|         6,785 |          8,192 |          503 |         12.8 |
+|        13,847 |         16,384 |          435 |         10.9 |
+|        19,290 |         32,768 |          424 |          9.4 |
+
+Decode is fastest at short contexts (~24 tok/s for prompts that fit in ≤1k context),
+steps down once the resident context grows past ~1k, then tapers gradually toward ~9
+tok/s at 32k — the global layers attend the whole history each step, so cost scales
+with the resident context. Because the cache is right-sized per session (above), a
+short prompt keeps the fast path instead of paying the maximum-context cost.

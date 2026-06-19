@@ -63,6 +63,18 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     // Sliding-cache ring depth S (last dim of the sliding cache); 0 when absent.
     private let slidingRingDepth: Int
 
+    // Right-sized global KV cache (memory + mid-context decode locality). The global
+    // key/value caches are allocated at the SESSION's current ctx bucket, not the model
+    // max: each bucket's graph is compiled with its own per-ctx seq strides, so the buffer
+    // must be laid out for exactly the running bucket. `currentGlobalCtx` is the ctx the
+    // global buffers are currently laid out for; `ensureGlobalCtx` grows + re-lays-out the
+    // written prefix when decode crosses into a larger bucket. The sliding
+    // ring is fixed-size across buckets, so it is allocated once and never re-laid-out.
+    private var currentGlobalCtx: Int
+    // ctx bucket → an extend function name with that ctx (any q_len), for fetching the
+    // per-ctx global-cache state descriptors when (re)allocating.
+    private let extendNameByCtx: [Int: String]
+
     // Combined per-dim RoPE theta (sliding ‖ global), precomputed once at init from
     // the model's dual-RoPE config. Gemma4 large-context graphs take precomputed
     // `rope_cos`/`rope_sin` rows (the runner builds them per step from this) instead
@@ -121,6 +133,27 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         // Validate output/state contract against the max-context function
         try Self.validateIOContract(descriptor: largestExtendDescriptor, functionName: largestExtendName)
 
+        // Diagnostic: dump each bucket's KV-cache physical layout (shape / preferred
+        // strides / channel interleave / byte count). Drives the right-sized-allocation
+        // work — confirms whether per-ctx buckets differ only in the seq-stride and how
+        // the channel interleave folds into the buffer. Gated; off by default.
+        if ProcessInfo.processInfo.environment["COREAI_CACHE_LAYOUT_DEBUG"] != nil {
+            for name in extendFunctionNames {
+                guard let d = model.functionDescriptor(for: name) else { continue }
+                for cacheName in [
+                    Self.keyCacheName, Self.valueCacheName,
+                    Self.slidingKeyCacheName, Self.slidingValueCacheName,
+                ] {
+                    guard case .ndArray(let cd) = d.stateDescriptor(of: cacheName) else { continue }
+                    let il =
+                        cd.interleaveLayout.map { "(dim \($0.dimension), factor \($0.factor))" } ?? "nil"
+                    CLILogger.log(
+                        "CACHE_LAYOUT \(name) \(cacheName): shape=\(cd.shape) "
+                            + "strides=\(cd.preferredStrides) interleave=\(il) bytes=\(cd.minimumByteCount)")
+                }
+            }
+        }
+
         // Load embeddings
         self.embeddingTable = try await Self.loadEmbeddingTable(from: model)
 
@@ -139,11 +172,13 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             self.perLayerEmbeddings = nil
         }
 
-        // Allocate one IOSurface NDArray per state, sized to the max-context
-        // descriptor. Single-cache models get key/value; Gemma4 also gets the
-        // fixed-depth sliding ring.
-        func allocateState(_ name: String) -> NDArray? {
-            guard case .ndArray(let d) = largestExtendDescriptor.stateDescriptor(of: name) else {
+        // Allocate one IOSurface NDArray per state. The sliding ring is fixed-size
+        // across buckets, so it is sized from the max-context descriptor once. The
+        // global key/value caches are RIGHT-SIZED: allocated at the smallest ctx
+        // bucket and grown (with a written-prefix re-layout) as decode crosses into
+        // larger buckets — see `ensureGlobalCtx`.
+        func allocateState(_ name: String, _ descriptor: InferenceFunctionDescriptor) -> NDArray? {
+            guard case .ndArray(let d) = descriptor.stateDescriptor(of: name) else {
                 return nil
             }
             CLILogger.log("Cache '\(name)' allocated: \(d.minimumByteCount) bytes (IOSurface)")
@@ -155,18 +190,36 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             Self.zeroCache(&arr)
             return arr
         }
-        guard let key = allocateState(Self.keyCacheName),
-            let value = allocateState(Self.valueCacheName)
+
+        // Map each ctx bucket → one of its extend function names (any q_len), so the
+        // global cache can be (re)allocated from the right per-ctx state descriptor.
+        var nameByCtx: [Int: String] = [:]
+        for name in extendFunctionNames where name.hasPrefix("extend") {
+            let ctx = try Self.contextLength(model: model, functionName: name, config: configuration)
+            if nameByCtx[ctx] == nil { nameByCtx[ctx] = name }
+        }
+        self.extendNameByCtx = nameByCtx
+        guard let smallestCtx = nameByCtx.keys.min(),
+            let smallestName = nameByCtx[smallestCtx],
+            let smallestDesc = model.functionDescriptor(for: smallestName)
+        else {
+            throw InferenceRuntimeError.invalidState("No extend function to size the global KV cache from")
+        }
+
+        // Global caches: start at the smallest ctx bucket (grown on demand).
+        guard let key = allocateState(Self.keyCacheName, smallestDesc),
+            let value = allocateState(Self.valueCacheName, smallestDesc)
         else {
             throw InferenceRuntimeError.invalidState(
                 "No KV cache state descriptors found — cannot allocate cache buffers")
         }
         self.keyCache = key
         self.valueCache = value
+        self.currentGlobalCtx = smallestCtx
         // Sliding ring (Gemma4). Absent on other models — alias key/value as an
         // unused placeholder so the properties stay non-optional and bindable.
-        let slidingKey = allocateState(Self.slidingKeyCacheName)
-        let slidingValue = allocateState(Self.slidingValueCacheName)
+        let slidingKey = allocateState(Self.slidingKeyCacheName, largestExtendDescriptor)
+        let slidingValue = allocateState(Self.slidingValueCacheName, largestExtendDescriptor)
         self.hasSlidingCache = slidingKey != nil && slidingValue != nil
         self.slidingKeyCache = slidingKey ?? key
         self.slidingValueCache = slidingValue ?? value
@@ -221,6 +274,90 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         var view = array.mutableView(as: LogitsScalarType.self)
         view.withUnsafeMutablePointer { ptr, _, _ in
             for i in 0..<count { ptr[i] = 0 }
+        }
+    }
+
+    // MARK: - Right-sized global KV cache (grow + re-layout)
+
+    /// Ensures the global key/value caches are laid out for context bucket `ctx`,
+    /// reallocating + re-laying-out the written prefix when it differs from the
+    /// currently-allocated `currentGlobalCtx`.
+    ///
+    /// Each bucket's graph is compiled with its own per-ctx seq strides (channel
+    /// stride = `ctx · interleave`), so the bound buffer must match the running
+    /// bucket exactly. Within a session `forwardGraph` picks the smallest ctx >
+    /// position, which is monotonic non-decreasing → this only ever grows mid-session;
+    /// after `reset()` (position 0) the first bucket shrinks it back with nothing to copy.
+    private func ensureGlobalCtx(_ ctx: Int) throws {
+        guard ctx != currentGlobalCtx else { return }
+        guard let name = extendNameByCtx[ctx],
+            let desc = model.functionDescriptor(for: name),
+            case .ndArray(let keyDesc) = desc.stateDescriptor(of: Self.keyCacheName),
+            case .ndArray(let valueDesc) = desc.stateDescriptor(of: Self.valueCacheName)
+        else {
+            throw InferenceRuntimeError.invalidState(
+                "Cannot resolve global KV cache descriptors for ctx \(ctx)")
+        }
+
+        var newKey = NDArray(descriptor: keyDesc)
+        var newValue = NDArray(descriptor: valueDesc)
+        Self.zeroCache(&newKey)
+        Self.zeroCache(&newValue)
+
+        // Copy the already-written seq prefix (positions [0, processedTokenCount)) into
+        // the new layout. Bounded by the old capacity (always ≥ written on a grow).
+        let copyLen = min(processedTokenCount, currentGlobalCtx)
+        if copyLen > 0 {
+            Self.copyGlobalPrefix(from: keyCache, to: &newKey, copyLen: copyLen)
+            Self.copyGlobalPrefix(from: valueCache, to: &newValue, copyLen: copyLen)
+        }
+
+        keyCache = newKey
+        valueCache = newValue
+        let bytes = keyDesc.minimumByteCount + valueDesc.minimumByteCount
+        CLILogger.log(
+            "Global KV cache re-laid-out: ctx \(currentGlobalCtx) → \(ctx) "
+                + "(copied \(copyLen) positions, \(bytes) bytes total k+v)")
+        currentGlobalCtx = ctx
+    }
+
+    /// Copies the first `copyLen` sequence positions of a flat global KV cache from
+    /// `src` to `dst`, re-laying-out for `dst`'s (larger) ctx.
+    ///
+    /// The cache is `[n, 1, C, 1, ctx]` with a channel interleave (dim 2, factor F):
+    /// physically `[n, C/F, ctx, F]` row-major (F innermost, seq next), with no
+    /// padding (`minimumByteCount == product · 2`). So for each of the
+    /// `groupCount = n · C / F` `(n, channel-group)` groups, positions [0, copyLen)
+    /// across the F interleaved channels form ONE contiguous run of `copyLen · F`
+    /// elements at group base `g · (ctx · F)`. src and dst share interleave + group
+    /// order, differing only in `ctx` (the seq stride scale) — so a per-group run copy
+    /// is correct regardless of the interleave details.
+    private static func copyGlobalPrefix(from src: NDArray, to dst: inout NDArray, copyLen: Int) {
+        let srcShape = src.shape
+        let dstShape = dst.shape
+        let seqDim = srcShape.count - 1
+        let srcSeq = srcShape[seqDim]
+        let dstSeq = dstShape[seqDim]
+        let factor = src.interleaveLayout?.factor ?? 1
+        precondition(
+            src.interleaveLayout?.dimension ?? 0 < seqDim,
+            "copyGlobalPrefix expects the interleaved dim to be inside the seq dim")
+        precondition(copyLen <= srcSeq && copyLen <= dstSeq, "copyGlobalPrefix overflow")
+
+        let groupCount = srcShape.reduce(1, *) / srcSeq / factor
+        let srcGroupStride = srcSeq * factor
+        let dstGroupStride = dstSeq * factor
+        let runElems = copyLen * factor
+
+        let srcView = src.view(as: LogitsScalarType.self)
+        srcView.withUnsafePointer { sptr, _, _ in
+            var dstView = dst.mutableView(as: LogitsScalarType.self)
+            dstView.withUnsafeMutablePointer { dptr, _, _ in
+                for g in 0..<groupCount {
+                    dptr.advanced(by: g * dstGroupStride)
+                        .update(from: sptr.advanced(by: g * srcGroupStride), count: runElems)
+                }
+            }
         }
     }
 
@@ -598,6 +735,11 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             let graphName = try forwardGraph(
                 numInputTokens: remaining, currentPosition: currentPosition, isPrefill: usePrefill)
 
+            // Right-size / grow the global KV cache to this bucket's ctx before binding
+            // (the sliding ring is fixed-size and never re-laid-out). processedTokenCount
+            // is the written prefix copied into the new layout on a grow.
+            try ensureGlobalCtx(try contextLength(of: graphName))
+
             let batchSize = try queryLength(of: graphName)
             let batchStartToken = (currentPosition / batchSize) * batchSize
             let batchEndToken = min(batchStartToken + batchSize - 1, totalTokenCount - 1)
@@ -808,8 +950,8 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
 
         // Step(s). Models have `in_step` (the absolute flat write offset into the
         // global cache). Gemma4 also has `sliding_in_step` = alignedStep % S, the
-        // sliding ring write offset (computed here so the graph needs no remainder op,
-        // which the ANE compiler can't lower). Both inputs match `*step*`, so set each
+        // sliding ring write offset (computed here so the graph needs no in-graph
+        // remainder op). Both inputs match `*step*`, so set each
         // by name.
         for stepName in desc.inputNames where stepName.contains("step") && !stepName.contains("pos") {
             guard case .ndArray(let nd) = desc.inputDescriptor(of: stepName) else { continue }

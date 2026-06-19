@@ -49,8 +49,8 @@ POSITION_IDS_INPUT_NAME = "position_ids"
 # Gemma4 large-context (blocked-ladder) path: RoPE cos/sin are precomputed in the
 # runner and passed as float16 graph inputs (the combined sliding+global table rows
 # for the chunk's positions), replacing ``position_ids`` + the in-graph gather — a
-# 131k position index overflows a 16-bit input and a 32-bit input crashes the
-# MPSGraph streaming compiler. All other iOS models keep ``position_ids``.
+# 131k position index overflows a 16-bit input and a 32-bit position input is not
+# supported by the streaming compile path. All other iOS models keep ``position_ids``.
 ROPE_COS_INPUT_NAME = "rope_cos"
 ROPE_SIN_INPUT_NAME = "rope_sin"
 IN_STEP_INPUT_NAME = "in_step"
@@ -74,8 +74,8 @@ SLIDING_VALUE_CACHE_OUTPUT_NAME = "new_sliding_v_cache"
 # Large-context global attention (Gemma4): the global cache stays FLAT
 # ``(n_global_storing, 1, C_g, 1, ctx)`` (one dynamic write offset), and the chunked
 # flash ``BlockedSDPA`` walks the flat slot in ``block_size`` chunks so each score op's
-# key axis stays ANE-resident up to ctx ~32768. ``block_size`` is the flash chunk width,
-# not a cache dimension.
+# key axis stays within the accelerator's per-dimension size limit up to ctx ~32768.
+# ``block_size`` is the flash chunk width, not a cache dimension.
 DEFAULT_KV_BLOCK_SIZE = 8192
 
 # Per-function query-length ladder for iOS static-shape specialization.
@@ -113,22 +113,15 @@ def context_ladder(max_context_length: int, block_size: int) -> list[int]:
     For ``ctx <= block_size`` the flash is a single chunk of width ``ctx`` (the
     small/fast buckets short prompts use); for ``ctx > block_size`` it unrolls
     ``ctx / block_size`` chunks of width ``block_size``. ``block_size`` only bounds
-    each chunk's score key-axis (ANE-safe); it is not a cache dimension or a floor on
-    the smallest bucket.
+    each chunk's score key-axis (keeping it within the accelerator's per-dimension size
+    limit); it is not a cache dimension or a floor on the smallest bucket.
 
     Examples (``block_size`` 8192): max 131072 -> [256, 512, ..., 65536, 131072];
     max 32768 -> [256, 512, ..., 32768]; max 512 -> [256, 512].
     """
-    # TEMP (regression bisection): COREAI_SINGLE_BUCKET emits only the full-size
-    # bucket, so the runner's shared-cache window is the full ctx (no sub-bucket
-    # slicing) — mirrors the pre-ladder single-program layout.
-    import os
-
     ctx_max = 1
     while ctx_max < max_context_length:
         ctx_max *= 2
-    if os.environ.get("COREAI_SINGLE_BUCKET"):
-        return [ctx_max]
     buckets: list[int] = []
     ctx = MIN_CONTEXT_LENGTH
     while ctx < ctx_max:
@@ -190,10 +183,10 @@ def _build_ios_reference_inputs(
 
         # FLAT global cache `[n_global_storing, 1, C_g, 1, ctx]` (same layout as the
         # generic flat KVCacheHandler): a single dynamic write offset (in_step), so each
-        # ANE region has ≤1 dynamic-offset LiveInParam. ``ctx`` is pinned per export
+        # attention region has ≤1 dynamic-offset slice. ``ctx`` is pinned per export
         # bucket; the chunked flash SDPA walks it in block_size chunks (a single
         # ctx-wide chunk when ctx <= block_size). (Above ctx ~32768 the flat slot read +
-        # mask exceed the ANE per-dim cap.)
+        # mask exceed the accelerator's per-dimension size limit.)
         if ctx is None:
             ctx = max_context_length
 
@@ -318,7 +311,7 @@ def _build_ios_reference_inputs(
 
 
 def _ios_decomp_table():
-    """iOS decomposition table: keep ``silu`` as-is (the ANE has a fused op)."""
+    """iOS decomposition table: keep ``silu`` as-is (the accelerator has a fused op)."""
     decomp_table = torch.export.default_decompositions()
     decomp_table.pop(torch.ops.aten.silu.default)
     decomp_table.pop(torch.ops.aten.silu.out)
@@ -594,8 +587,8 @@ async def _convert_blocked_ladder_to_coreai(
     ``q_len`` as the only static-shape specialization, so the emitted functions are
     ``extend_{ctx}_{q}`` / ``prompt_opt_{ctx}_{q}`` — exactly what the runner picks
     from by context. The shared model weights are referenced (not copied) across
-    the programs, and the runner backs every function's global cache with one
-    allocation sized at the max ctx, sliced along the seq dim per function.
+    the programs, and the runner right-sizes the global cache to the running bucket's
+    ctx (growing + re-laying-out the written prefix on a bucket switch).
     """
     converter = TorchConverter()
     register_custom_torch_lowering(converter)
@@ -706,6 +699,12 @@ async def _convert_blocked_ladder_to_coreai(
     )
 
     def _forward_constraints(ctx: int) -> dict:
+        # Per-bucket seq-stride alignment = THIS bucket's ctx (channel stride = ctx·interleave).
+        # The runner right-sizes the global KV cache per session and re-lays-out (grow + copy the
+        # written prefix) on a bucket switch, so each bucket's buffer is laid out for its own ctx
+        # — smaller allocation + better decode locality than one shared max-ctx buffer. The runner
+        # MUST allocate/grow the global cache to match the running bucket's ctx exactly (it does;
+        # the sliding ring is fixed-size and never grows).
         cache_constraints = HardwareConstraints(
             AllocationType.IOSurface,
             interleave=[1, 1, KV_CACHE_INTERLEAVE_FACTOR, 1, 1],

@@ -39,10 +39,11 @@ from coreai_models.primitives.ios.rope import RoPECache, apply_rope
 from coreai_models.primitives.ios.sdpa import SDPA, BlockedSDPA
 
 # Flash chunk width for the global (full-attention) ``BlockedSDPA`` over the flat cache:
-# the largest key-axis chunk whose per-block score/softmax stays within the Neural
-# Engine's supported sizes; 8192 is the empirically-proven value on h16c. Overridable via
-# the config attribute ``kv_block_size`` (tests use a small value to exercise multiple
-# chunks cheaply). Must be a multiple of max(QUERY_LENGTHS) for the no-straddle write.
+# the largest key-axis chunk whose per-block score/softmax stays within the
+# accelerator's supported tensor sizes; 8192 is the empirically-proven value.
+# Overridable via the config attribute ``kv_block_size`` (tests use a small value to
+# exercise multiple chunks cheaply). Must be a multiple of max(QUERY_LENGTHS) for the
+# no-straddle write.
 DEFAULT_KV_BLOCK_SIZE = 8192
 
 
@@ -163,8 +164,9 @@ class Attention(nn.Module):
         self.is_sliding = is_sliding
         # Both caches are flat. Global (full-attention) layers run the chunked flash
         # ``BlockedSDPA`` over the flat slot (block_size chunks keep the score key-axis
-        # ANE-safe up to ctx ~32768); sliding layers use the small S=576 ring + flat
-        # ``SDPA``. ``BlockedSDPA``/``SDPA`` share the same (q, k, v, mask) signature.
+        # within the accelerator's size limit up to ctx ~32768); sliding layers use the
+        # small S=576 ring + flat ``SDPA``. ``BlockedSDPA``/``SDPA`` share the same
+        # (q, k, v, mask) signature.
         self.is_blocked = not is_sliding
         self.is_kv_shared = is_kv_shared
         # Slot in this layer's type-specific cache: the read+write slot for
@@ -207,7 +209,7 @@ class Attention(nn.Module):
         ``write_offset`` is the dynamic flat write offset into this layer's cache: the
         ring offset (``in_step % S``) for sliding layers, the absolute position
         (``in_step``) for global layers — a SINGLE dynamic offset into a flat cache (no
-        block index), so each region has ≤1 dynamic-offset LiveInParam.
+        block index), so each region has ≤1 dynamic-offset slice.
         ``causal_mask`` is the flat ``(1, S, 1, q_len)`` sliding mask or the flat
         ``(1, ctx, 1, q_len)`` global mask; global layers walk it in block_size chunks
         inside ``BlockedSDPA``.
@@ -448,8 +450,8 @@ class Gemma4Model(nn.Module):
         # RoPE cos/sin are precomputed in the runner and passed in as graph inputs
         # (``rope_cos`` / ``rope_sin``, the combined sliding+global table rows for the
         # chunk's positions) — see ``forward``. The position index for a 131k context
-        # exceeds a 16-bit input and a 32-bit position input crashes the MPSGraph
-        # streaming compiler, so the in-graph gather (and its ~400 MB cos/sin constant
+        # exceeds a 16-bit input and a 32-bit position input is not supported by the
+        # streaming compile path, so the in-graph gather (and its ~400 MB cos/sin constant
         # tables) is removed. ``Gemma4CombinedRoPE`` is kept as the numerical reference
         # the runner / parity reimplements (its ``_compute_sin_and_cos``).
 
@@ -557,12 +559,12 @@ class Gemma4Extend(nn.Module):
         else:
             self.lm_head = None
 
-        # Two compacted KV caches, both FLAT (single dynamic write offset, so each ANE
-        # region has ≤1 dynamic-offset LiveInParam):
+        # Two compacted KV caches, both FLAT (single dynamic write offset, so each
+        # attention region has ≤1 dynamic-offset slice):
         #  - global: full-context flat cache `[n_global_storing, 1, C_g, 1, ctx]`; the
         #    chunked flash `BlockedSDPA` walks the flat slot in block_size chunks, so the
-        #    score key-axis stays ANE-safe up to ctx ~32768. (Beyond that the flat slot
-        #    read + mask exceed the ANE ~65536 per-dim cap — a compiler limit.)
+        #    score key-axis stays within the accelerator's size limit up to ctx ~32768.
+        #    (Beyond that the flat slot read + mask exceed the ~65536 per-dimension cap.)
         #  - sliding: small ring (static seq dim S), n_kv * head_dim channels.
         n_kv_heads = config.num_key_value_heads
         global_channels = n_kv_heads * config.global_head_dim
@@ -619,7 +621,8 @@ class Gemma4Extend(nn.Module):
             # Prefill output is unused (the runner only wants the cache writes); return
             # a width-1 slice that still depends on both global cache writes so they are
             # not dead-code-eliminated. (A full-width slice would be a block_size-wide
-            # tensor — needless, and ctx-wide for a flat cache, which trips ANEC.)
+            # tensor — needless, and ctx-wide for a flat cache, which exceeds the
+            # accelerator's per-dimension size limit.)
             return (
                 self.global_cache.k_cache[0, 0, 0, 0, :1]
                 + self.global_cache.v_cache[0, 0, 0, 0, :1]

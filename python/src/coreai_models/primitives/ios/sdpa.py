@@ -104,18 +104,17 @@ class BlockedSDPA(nn.Module):
     """Blocked / flash global attention for large-context iOS.
 
     The flat ``SDPA`` forms one score tensor whose key axis spans the full context;
-    above ~32k that tensor trips the Neural Engine's ANEC compile (``"Concat root
-    tensor too large"``) and the global layers fall to the GPU. ``BlockedSDPA`` is a
-    drop-in with the **same signature** (it reads the flat cache slot ``(1, C, 1,
-    ctx)`` and flat mask ``(1, ctx, 1, q)``) but walks the key axis in ``block_size``
-    chunks with the textbook **online-softmax (flash)** recurrence — algebraically
-    identical to one big softmax (parity ~1e-6) while every score op's key axis is
-    only ``block_size``.
+    above ~32k that tensor exceeds the accelerator's per-dimension size limit and the
+    global layers fall back to the GPU. ``BlockedSDPA`` is a drop-in with the **same
+    signature** (it reads the flat cache slot ``(1, C, 1, ctx)`` and flat mask
+    ``(1, ctx, 1, q)``) but walks the key axis in ``block_size`` chunks with the
+    textbook **online-softmax (flash)** recurrence — algebraically identical to one big
+    softmax (parity ~1e-6) while every score op's key axis is only ``block_size``.
 
-    This pushes the global layers onto the ANE up to ctx ~32768; beyond that the
+    This keeps the global layers on the accelerator up to ctx ~32768; beyond that the
     ``(1, C, 1, ctx)`` slot read and ``(1, ctx, 1, q)`` mask themselves exceed the
-    ANE's ~65536 per-dim cap (a compiler limit, not an attention-shape one). The
-    block loop is unrolled (``n_blocks`` static per export bucket); each block keeps
+    ~65536 per-dimension limit (a hardware/compiler limit, not an attention-shape one).
+    The block loop is unrolled (``n_blocks`` static per export bucket); each block keeps
     per-head rank-4 ``q@k`` / rank-3 ``scores@v`` (no rank-5 matmul).
     """
 
