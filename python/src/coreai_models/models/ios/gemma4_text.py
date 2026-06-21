@@ -619,13 +619,15 @@ class Gemma4Extend(nn.Module):
 
         if self.prefill_mode:
             # Prefill output is unused (the runner only wants the cache writes); return
-            # a width-1 slice that still depends on both global cache writes so they are
-            # not dead-code-eliminated. (A full-width slice would be a block_size-wide
-            # tensor — needless, and ctx-wide for a flat cache, which exceeds the
-            # accelerator's per-dimension size limit.)
+            # a width-1 value that still depends on both global cache writes so they are
+            # not dead-code-eliminated. Use rank-preserving width-1 slices on EVERY dim
+            # (shape (1,1,1,1,1)) rather than integer indexing: integer indexing squeezes
+            # the leading dims and lowers to a rank-1 `(ctx,)` reshape before the final
+            # slice, and a rank-1 ctx tensor exceeds the accelerator's per-dim size limit
+            # at large ctx (e.g. 131072). Slicing keeps rank 5, so no ctx-wide tensor forms.
             return (
-                self.global_cache.k_cache[0, 0, 0, 0, :1]
-                + self.global_cache.v_cache[0, 0, 0, 0, :1]
+                self.global_cache.k_cache[:1, :1, :1, :1, :1]
+                + self.global_cache.v_cache[:1, :1, :1, :1, :1]
             )
 
         if self.lm_head is not None:

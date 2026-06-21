@@ -104,18 +104,18 @@ class BlockedSDPA(nn.Module):
     """Blocked / flash global attention for large-context iOS.
 
     The flat ``SDPA`` forms one score tensor whose key axis spans the full context;
-    above ~32k that tensor exceeds the accelerator's per-dimension size limit and the
-    global layers fall back to the GPU. ``BlockedSDPA`` is a drop-in with the **same
-    signature** (it reads the flat cache slot ``(1, C, 1, ctx)`` and flat mask
+    above ~64k that tensor exceeds the accelerator's per-dimension size limit and the
+    global layers fall back to a slower path. ``BlockedSDPA`` is a drop-in with the
+    **same signature** (it reads the flat cache slot ``(1, C, 1, ctx)`` and flat mask
     ``(1, ctx, 1, q)``) but walks the key axis in ``block_size`` chunks with the
     textbook **online-softmax (flash)** recurrence — algebraically identical to one big
     softmax (parity ~1e-6) while every score op's key axis is only ``block_size``.
 
-    This keeps the global layers on the accelerator up to ctx ~32768; beyond that the
-    ``(1, C, 1, ctx)`` slot read and ``(1, ctx, 1, q)`` mask themselves exceed the
-    ~65536 per-dimension limit (a hardware/compiler limit, not an attention-shape one).
-    The block loop is unrolled (``n_blocks`` static per export bucket); each block keeps
-    per-head rank-4 ``q@k`` / rank-3 ``scores@v`` (no rank-5 matmul).
+    With block-scaled accumulation (no fp16 overflow) and a context-gated value matmul
+    (no full-width cache transpose), the global layers stay accelerator-resident and
+    numerically correct through ctx 131072. The block loop is unrolled (``n_blocks``
+    static per export bucket); each block keeps per-head rank-4 ``q@k`` / rank-3
+    ``scores@v`` (no rank-5 matmul).
     """
 
     def __init__(
@@ -159,27 +159,50 @@ class BlockedSDPA(nn.Module):
         q_len = query.shape[-1]
         kv_group_size = n_heads // (key.shape[1] // head_dim)
 
+        # Fold 1/block_size into the exp weights so no fp16 accumulator can grow with the
+        # key count. The textbook flash recurrence carries the *unnormalized* sums
+        # ``l = Σ exp(s-m)`` and ``acc = Σ exp(s-m)·v``, both of which grow ~linearly with
+        # the number of attended keys and overflow fp16 past ~15k keys on the accelerator
+        # (the CPU reference hides this by accumulating in fp32). Instead we carry the
+        # output *normalized* (``o ≈ |v|``) and the denominator in block-scaled units
+        # (``l ≤ n_blocks``); each block contributes ``p@v`` with ``p = exp(s-m)/block_size``
+        # so the per-block matmul sum is ≤ |v|. Algebraically identical to one softmax.
+        inv_block = 1.0 / float(block_size)
+        # A `[C-W]` transpose of the value cache INPUT gets hoisted by the compiler above
+        # the per-block slice into a full-width (1, C, 1, ctx) transpose, whose ctx dim
+        # exceeds the accelerator's ~65536 per-dimension limit and drops the layer to a
+        # slower path. Above that limit, avoid transposing `v` (form `p@v` as `(v @ pᵀ)ᵀ`,
+        # transposing the small computed `p` instead). At/below it the direct `p @ v` with a
+        # pre-transposed `v` compiles to a faster kernel, so keep it — it's what short/mid
+        # contexts use, and it's measurably quicker there.
+        hoist_safe = ctx > 65536
         outs = []
         for head_idx in range(n_heads):
             c0 = head_dim * (head_idx // kv_group_size)  # this head's K/V channel base
             q = queries[head_idx].permute(0, 2, 3, 1)    # (1, 1, q_len, head_dim)
-            # Running max / denominator / weighted sum. -40000 is the fp16-safe -inf
-            # the mask uses; block 0 always has an unmasked key, so it becomes real.
+            # Running max / block-scaled denominator / normalized output. -40000 is the
+            # fp16-safe -inf the mask uses; block 0 always has an unmasked key, so it
+            # becomes real on the first iteration.
             m = torch.full((1, 1, q_len, 1), -40000.0, dtype=q.dtype)
             l = torch.zeros((1, 1, q_len, 1), dtype=q.dtype)
-            acc = torch.zeros((1, q_len, head_dim), dtype=q.dtype)
+            o = torch.zeros((1, q_len, head_dim), dtype=q.dtype)
             for t in range(n_blocks):
                 lo, hi = t * block_size, min((t + 1) * block_size, ctx)
                 k = (key[:, c0:c0 + head_dim, :, lo:hi] * self._scale_factor).permute(0, 2, 1, 3)
-                v = value[:, c0:c0 + head_dim, :, lo:hi].squeeze(2).transpose(1, 2)  # (1, B, head_dim)
+                vraw = value[:, c0:c0 + head_dim, :, lo:hi].squeeze(2)                # (1, head_dim, B)
                 s = q @ k + causal_mask[:, lo:hi].permute(0, 2, 3, 1)                # (1, 1, q_len, B)
 
                 m_new = torch.maximum(m, s.max(dim=-1, keepdim=True).values)
                 corr = torch.exp(m - m_new)
-                p = torch.exp(s - m_new)
-                l = l * corr + p.sum(dim=-1, keepdim=True)
-                acc = acc * corr.squeeze(1) + p.squeeze(1) @ v
+                p = torch.exp(s - m_new) * inv_block        # block-scaled weights, ≤ 1 per key
+                prev = l * corr                             # carried denom rescaled to new max
+                l = prev + p.sum(dim=-1, keepdim=True)
+                if hoist_safe:
+                    pv = (vraw @ p.squeeze(1).transpose(1, 2)).transpose(1, 2)       # (1, q_len, head_dim)
+                else:
+                    pv = p.squeeze(1) @ vraw.transpose(1, 2)                         # (1, q_len, head_dim)
+                o = (o * prev.squeeze(1) + pv) / l.squeeze(1)  # convex update, stays ≈ |v|
                 m = m_new
-            outs.append((acc / l.squeeze(1)).transpose(1, 2).unsqueeze(2))
+            outs.append(o.transpose(1, 2).unsqueeze(2))
 
         return torch.cat(outs, dim=1)

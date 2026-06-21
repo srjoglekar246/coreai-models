@@ -128,6 +128,14 @@ def context_ladder(max_context_length: int, block_size: int) -> list[int]:
         buckets.append(ctx)
         ctx *= 2
     buckets.append(ctx_max)
+    # Dev override: GEMMA4_LADDER_ONLY="131072" (comma-separated) emits only those buckets,
+    # to isolate a single context's graphs (e.g. measure the 131072-only realize floor).
+    import os as _os
+
+    _only = _os.environ.get("GEMMA4_LADDER_ONLY")
+    if _only:
+        want = {int(x) for x in _only.split(",")}
+        buckets = [b for b in buckets if b in want] or [ctx_max]
     return buckets
 
 
